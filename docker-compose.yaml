@@ -1,0 +1,13 @@
+services:
+  idi-company-facts:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    volumes:
+      - .:/project
+      
+    
+    shm_size: '16gb'
+    # At least one of stdin_open or tty is required to make devcontainer work
+    stdin_open: true
+    tty: true
