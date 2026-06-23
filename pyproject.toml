@@ -12,6 +12,12 @@ dependencies = [
   "idi-ftm2j-shared>=0.1.3",
 ]
 
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0.0",
+  "ruff>=0.8.0",
+]
+
 [tool.ruff]
 line-length = 100
 
@@ -39,6 +45,8 @@ extend-select = [
 
 ignore = [
   "D415",   # allow first line of doctstrings to end without punctuation
+  "ANN101", # self does not need a type annotation
+  "ANN102", # cls does not need a type annotation
   "ANN002", # missing type on *args
   "ANN003", # missing type on **kwargs
   "B905",   # won't work on python <3.10
@@ -47,6 +55,3 @@ ignore = [
 
 [tool.ruff.lint.pydocstyle]
 convention = "google"
-
-[tool.pytest.ini_options]
-python_files = "test_*.py"
