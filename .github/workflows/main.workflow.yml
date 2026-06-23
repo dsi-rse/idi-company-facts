@@ -25,7 +25,7 @@ jobs:
         run: uv python install 3.13
 
       - name: Install Dependencies
-        run: uv sync
+        run: uv sync --all-extras --all-groups
 
       - name: Lint with ruff
         run: uv run ruff check . --output-format=concise
