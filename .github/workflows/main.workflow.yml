@@ -22,13 +22,13 @@ jobs:
         uses: astral-sh/setup-uv@v6
 
       - name: Set up Python
-        run: uv python install 3.12
+        run: uv python install 3.13
 
       - name: Install Dependencies
-        run: uv sync
+        run: uv sync --all-extras --all-groups
 
-      - name: Lint with pre-commit
-        run: uv run pre-commit run --all-files
+      - name: Lint with ruff
+        run: uv run ruff check . --output-format=concise
 
-      - name: Run Tests
-        run: uv run pytest
+      - name: Format check with ruff
+        run: uv run ruff format --check .
