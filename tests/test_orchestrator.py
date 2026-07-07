@@ -202,4 +202,3 @@ class TestGetArgs:
         monkeypatch.setattr(sys, "argv", _FULL_ARGS)
         args = get_args()
         assert args.failure_flush_every == 50
-
