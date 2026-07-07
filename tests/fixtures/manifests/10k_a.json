@@ -1,0 +1,21 @@
+{
+  "cik": "0000789019",
+  "accession_number": "0000789019-24-000456",
+  "form_type": "10-K/A",
+  "filing_date": "2024-02-10",
+  "last_scraped_at": "2024-02-11T00:00:00",
+  "index_url": "https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK=789019",
+  "company_name": "MICROSOFT CORP",
+  "report_date": "2023-06-30",
+  "failure_reason": "",
+  "documents": [
+    {
+      "filename": "msft-20230630.htm",
+      "url": "https://www.sec.gov/Archives/edgar/data/789019/000078901924000456/msft-20230630.htm",
+      "description": "10-K/A",
+      "type": "10-K/A",
+      "seq": "1",
+      "s3_key": "sec/2024-02-10/10-K_A/789019/000078901924000456/msft-20230630.htm"
+    }
+  ]
+}
