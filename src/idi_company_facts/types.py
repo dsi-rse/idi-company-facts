@@ -39,12 +39,17 @@ class PipelineConfig:
 class PipelineStats:
     """Thread-safe counters tracking pipeline progress and failures."""
 
+    # load_input counters
     total_filings: int = 0
     failed_filings: int = 0
     total_primary_docs: int = 0
     failed_primary_docs: int = 0
-    timeout_primary_docs: int = 0
+    # process counters
+    queued_documents: int = 0
+    documents_fetched: int = 0
     extracted_documents: int = 0
+    parse_failures: int = 0
+    storage_errors: int = 0
 
     def __post_init__(self) -> None:
         """Initialize the pipeline stats."""
@@ -73,9 +78,9 @@ class CompanyFactsRecord:
     filing_date: date | None = None
     report_date: date | None = None  # Fiscal year end of the report
     company_name: str = ""
-    tickers: str = ""
-    securities: str = ""
-    exchanges: str = ""
+    security_name: str = ""
+    ticker: str = ""
+    exchange: str = ""
     market_value: str = ""
     market_value_as_of_date: date | None = None
     market_value_currency: str = ""

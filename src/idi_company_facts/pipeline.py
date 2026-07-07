@@ -2,15 +2,21 @@
 
 # Standard application imports
 import datetime
+import queue
 import re
+import threading
 from abc import ABC, abstractmethod
+from dataclasses import asdict
 
 # Third party imports
+import pandas as pd
 from idi_ftm2j_shared.failures import FailureRegistry
 from idi_ftm2j_shared.logs import get_logger
 from idi_ftm2j_shared.sec import ScrapedDocument, ScrapedFiling, iter_filings_by_form_type
+from idi_ftm2j_shared.storage import load_content
 
 # Application imports
+from idi_company_facts.extractor import CompanyFactsExtractor
 from idi_company_facts.failures import CompanyFactsFailureClassifier, FailureType
 from idi_company_facts.types import (
     TARGET_FORM_TYPES,
@@ -19,6 +25,7 @@ from idi_company_facts.types import (
     PipelineConfig,
     PipelineStats,
 )
+from idi_company_facts.xbrl.parser import InlineXbrlDocument, NotInlineXbrlError, XbrlParseError
 
 
 class Pipeline(ABC):
@@ -126,6 +133,7 @@ class CompanyFactsPipeline(Pipeline):
             classifier=CompanyFactsFailureClassifier(),
             flush_every=config.failure_flush_every,
         )
+        self.extractor = CompanyFactsExtractor(stats=self.stats)
 
     def run(self) -> None:
         """Run the pipeline, flushing any buffered failures on completion."""
@@ -189,19 +197,139 @@ class CompanyFactsPipeline(Pipeline):
         typed = [d for d in scraped_filing.documents if cls._PRIMARY_TYPE_RE.match(d.type or "")]
         return typed[0] if typed else None
 
-    def process(self, input_list: list[Filing]) -> list[CompanyFactsRecord]:
-        """Fetch and parse each filing's primary document; return extracted records.
+    def _extract_worker(self, work_queue: queue.Queue, results_queue: queue.Queue) -> None:
+        """Worker thread that fetches and parses one filing's primary document.
 
-        Not yet implemented — deferred to the XBRL extraction PR.
+        Runs as a daemon thread, consuming :class:`Filing` objects from
+        ``work_queue`` and posting extracted :class:`CompanyFactsRecord` results
+        to ``results_queue``. Multi-class filings produce one record per security.
+        Failures are recorded inside :meth:`_process_one` so the worker loop
+        always continues.
+
+        Args:
+            work_queue: Queue of :class:`Filing` objects to process.
+            results_queue: Queue to which successfully extracted
+                :class:`CompanyFactsRecord` objects are posted.
         """
-        raise NotImplementedError
+        while True:
+            filing = work_queue.get()
+            try:
+                for record in self._process_one(filing):
+                    results_queue.put(record)
+            finally:
+                work_queue.task_done()
+
+    def _results_worker(
+        self, results_queue: queue.Queue, records: list[CompanyFactsRecord]
+    ) -> None:
+        """Worker thread that collects extracted records from the results queue.
+
+        Runs as a daemon thread, appending each :class:`CompanyFactsRecord`
+        from ``results_queue`` to the shared ``records`` list.
+
+        Args:
+            results_queue: Queue of :class:`CompanyFactsRecord` objects produced
+                by :meth:`_extract_worker`.
+            records: Shared list to which records are appended. Only this thread
+                writes to it.
+        """
+        while True:
+            record = results_queue.get()
+            records.append(record)
+            results_queue.task_done()
+
+    def process(self, input_list: list[Filing]) -> list[CompanyFactsRecord]:
+        """Fetch each filing's primary document from S3 and extract company facts.
+
+        Extraction runs across :attr:`~PipelineConfig.num_workers` daemon threads.
+        The main thread feeds filings into a bounded work queue; a single results
+        thread collects completed records.
+
+        Args:
+            input_list: Filings returned by :meth:`load_input`.
+
+        Returns:
+            Extracted :class:`CompanyFactsRecord` objects (failures are excluded).
+        """
+        work_queue: queue.Queue = queue.Queue(maxsize=self.config.num_workers * 2)
+        results_queue: queue.Queue = queue.Queue()
+        records: list[CompanyFactsRecord] = []
+
+        extract_workers = [
+            threading.Thread(
+                target=self._extract_worker,
+                args=(work_queue, results_queue),
+                daemon=True,
+                name=f"extract-worker-{i}",
+            )
+            for i in range(self.config.num_workers)
+        ]
+        for worker in extract_workers:
+            worker.start()
+
+        threading.Thread(
+            target=self._results_worker,
+            args=(results_queue, records),
+            daemon=True,
+            name="results-worker",
+        ).start()
+
+        for filing in input_list:
+            work_queue.put(filing)
+            self.stats.increment("queued_documents")
+
+        work_queue.join()
+        results_queue.join()
+
+        return records
+
+    def _process_one(self, filing: Filing) -> list[CompanyFactsRecord]:
+        """Fetch, parse, and extract facts from one filing's primary document.
+
+        Returns one record per security class; empty list on any failure.
+        """
+        s3_url = filing.primary_s3_key  # manifest s3_key is already a full s3:// URL
+        try:
+            html_bytes = load_content(s3_url)
+            if not html_bytes:
+                self.failures.add((filing.cik, filing.accession_number), FailureType.EMPTY_DOCUMENT)
+                self.stats.increment("storage_errors")
+                return []
+            self.stats.increment("documents_fetched")
+            doc = InlineXbrlDocument(html_bytes)
+            records = self.extractor.extract(filing, doc)
+            self.stats.increment("extracted_documents", len(records))
+            return records
+        except NotInlineXbrlError:
+            self.failures.add((filing.cik, filing.accession_number), FailureType.NO_INLINE_XBRL)
+            self.stats.increment("parse_failures")
+            return []
+        except XbrlParseError:
+            self.failures.add((filing.cik, filing.accession_number), FailureType.MALFORMED_XBRL)
+            self.stats.increment("parse_failures")
+            return []
+        except Exception:
+            self.logger.exception("Unexpected error processing %s", filing.accession_number)
+            self.failures.add((filing.cik, filing.accession_number), FailureType.STORAGE_ERROR)
+            self.stats.increment("storage_errors")
+            return []
 
     def save_output(self, processed_list: list[CompanyFactsRecord]) -> None:
-        """Persist records to the configured output parquet file.
+        """Persist extracted records to the configured output parquet file.
 
-        Not yet implemented — deferred to the XBRL extraction PR.
+        Deduplicates within the current run on (company_cik, accession_number)
+        and writes to the output path, overwriting any existing file.
+
+        Args:
+            processed_list: Records returned by :meth:`process`.
         """
-        raise NotImplementedError
+        if not processed_list:
+            self.logger.info("no records extracted; skipping output write")
+            return
+        df = pd.DataFrame([asdict(r) for r in processed_list])
+        df = df.drop_duplicates(subset=["company_cik", "accession_number", "ticker"])
+        df.to_parquet(self.config.output_file, index=False)
+        self.logger.info("Saved %d records to %s", len(df), self.config.output_file)
 
     def display_stats(self) -> None:
         """Log a formatted summary of pipeline statistics on completion."""
@@ -209,11 +337,14 @@ class CompanyFactsPipeline(Pipeline):
         self.logger.info("Pipeline Stats")
         self.logger.info("=" * 40)
         self.logger.info("  Filings")
-        self.logger.info("    Total:           %d", self.stats.total_filings)
-        self.logger.info("    Failed upstream: %d", self.stats.failed_filings)
-        self.logger.info("    No primary doc:  %d", self.stats.failed_primary_docs)
-        self.logger.info("    Timeout:         %d", self.stats.timeout_primary_docs)
+        self.logger.info("    Total:              %d", self.stats.total_filings)
+        self.logger.info("    Failed upstream:    %d", self.stats.failed_filings)
+        self.logger.info("    No primary doc:     %d", self.stats.failed_primary_docs)
         self.logger.info("  Primary Documents")
-        self.logger.info("    Loaded:          %d", self.stats.total_primary_docs)
-        self.logger.info("    Extracted:       %d", self.stats.extracted_documents)
+        self.logger.info("    Loaded:             %d", self.stats.total_primary_docs)
+        self.logger.info("    Queued:             %d", self.stats.queued_documents)
+        self.logger.info("    Fetched from S3:    %d", self.stats.documents_fetched)
+        self.logger.info("    Extracted:          %d", self.stats.extracted_documents)
+        self.logger.info("    Parse failures:     %d", self.stats.parse_failures)
+        self.logger.info("    Storage errors:     %d", self.stats.storage_errors)
         self.logger.info("=" * 40)

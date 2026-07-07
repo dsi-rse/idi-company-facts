@@ -105,8 +105,11 @@ class TestPipelineStats:
         assert stats.failed_filings == 0
         assert stats.total_primary_docs == 0
         assert stats.failed_primary_docs == 0
-        assert stats.timeout_primary_docs == 0
+        assert stats.queued_documents == 0
+        assert stats.documents_fetched == 0
         assert stats.extracted_documents == 0
+        assert stats.parse_failures == 0
+        assert stats.storage_errors == 0
 
     def test_counters_are_mutable(self) -> None:
         """PipelineStats is not frozen — counters can be assigned directly."""

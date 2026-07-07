@@ -264,27 +264,29 @@ class TestRun:
 
         assert (no_doc.cik, no_doc.accession_number) in pipeline.failures
 
-    def test_process_raises_when_filings_present(
+    def test_process_called_when_filings_present(
         self, pipeline: CompanyFactsPipeline, mocker: MockerFixture
     ) -> None:
-        """process() is called (and raises NotImplementedError) when filings are found."""
+        """process() is invoked for each valid filing returned by load_input."""
         good = make_manifest()
         mocker.patch(
             "idi_company_facts.pipeline.iter_filings_by_form_type",
             return_value=iter([good]),
         )
+        process_one = mocker.patch.object(pipeline, "_process_one", return_value=[])
 
-        with pytest.raises(NotImplementedError):
-            pipeline.run()
+        pipeline.run()
+
+        process_one.assert_called_once()
 
     def test_failures_flushed_even_when_process_raises(
         self, pipeline: CompanyFactsPipeline, mocker: MockerFixture
     ) -> None:
-        """Failures from load_input are flushed even when process() later raises.
+        """Failures from load_input are persisted even when process() raises.
 
         Provide both a no-primary-doc manifest (records MISSING_DOCUMENT) and a
         good manifest (causes process() to be invoked).  The MISSING_DOCUMENT
-        failure must survive the NotImplementedError from the stub.
+        failure must be flushed despite the RuntimeError from process.
         """
         no_doc = make_manifest(
             cik="1111111111",
@@ -299,8 +301,9 @@ class TestRun:
             "idi_company_facts.pipeline.iter_filings_by_form_type",
             return_value=iter([no_doc, good]),
         )
+        mocker.patch.object(pipeline, "process", side_effect=RuntimeError("boom"))
 
-        with pytest.raises(NotImplementedError):
+        with pytest.raises(RuntimeError):
             pipeline.run()
 
         assert (no_doc.cik, no_doc.accession_number) in pipeline.failures
