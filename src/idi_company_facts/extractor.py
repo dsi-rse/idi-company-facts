@@ -3,7 +3,8 @@
 import datetime
 from decimal import Decimal
 
-from idi_company_facts.types import CompanyFactsRecord, Filing, PipelineStats
+from idi_company_facts.failures import FailureType
+from idi_company_facts.types import CompanyFactsRecord, Filing
 from idi_company_facts.xbrl.concepts import (
     PERIOD_END,
     PUBLIC_FLOAT,
@@ -29,15 +30,12 @@ def _fmt(value: Decimal) -> str:
 class CompanyFactsExtractor:
     """Extract structured company facts from a 10-K iXBRL document."""
 
-    def __init__(self, stats: PipelineStats) -> None:
-        """Initialize with a shared stats object for incrementing counters.
+    def __init__(self) -> None:
+        """Initialize the extractor."""
 
-        Args:
-            stats: Pipeline statistics object shared across worker threads.
-        """
-        self.stats = stats
-
-    def extract(self, filing: Filing, doc: InlineXbrlDocument) -> list[CompanyFactsRecord]:
+    def extract(
+        self, filing: Filing, doc: InlineXbrlDocument
+    ) -> tuple[list[CompanyFactsRecord], list[FailureType]]:
         """Map one (filing, document) pair to exactly one CompanyFactsRecord.
 
         Extracts entity-level (dimensionless) common stock facts only. Multi-class
@@ -48,42 +46,53 @@ class CompanyFactsExtractor:
             doc: Parsed iXBRL document for the filing's primary 10-K exhibit.
 
         Returns:
-            A single-element list containing the extracted :class:`CompanyFactsRecord`.
+            A tuple of (records, failures) where records is a single-element list
+            containing the extracted :class:`CompanyFactsRecord` and failures is a
+            list of :class:`FailureType` values for non-fatal extraction issues.
         """
         period_end = self._period_end(doc)
         market_value, mv_date, mv_currency = self._market_value(doc)
         shell = self._shell_company(doc)
-        revenue, rev_date, rev_currency = self._revenue(doc, period_end)
+        revenue, rev_date, rev_currency, rev_ambiguous = self._revenue(doc, period_end)
         registrant = self._registrant_name(doc) or filing.company_name
 
         shares, shares_date, security_name, ticker, exchange = self._common_stock(doc)
 
+        failures: list[FailureType] = []
+        if period_end is None:
+            # Missing anchor — don't also report NO_REVENUE_CONCEPT since the
+            # revenue walk was never run against a valid period end.
+            failures.append(FailureType.MISSING_PERIOD_END)
+        elif revenue is None:
+            failures.append(FailureType.NO_REVENUE_CONCEPT)
+        elif rev_ambiguous:
+            failures.append(FailureType.AMBIGUOUS_REVENUE)
+
         now = datetime.datetime.now(datetime.UTC)
-        return [
-            CompanyFactsRecord(
-                company_cik=filing.cik,
-                accession_number=filing.accession_number,
-                form_type=filing.form_type,
-                doc_type=filing.form_type,
-                primary_url=filing.primary_url,
-                filing_date=filing.filing_date,
-                report_date=period_end,
-                company_name=registrant,
-                security_name=security_name,
-                ticker=ticker,
-                exchange=exchange,
-                market_value=_fmt(market_value) if market_value is not None else "",
-                market_value_as_of_date=mv_date,
-                market_value_currency=mv_currency or "",
-                shares_outstanding=_fmt(shares) if shares is not None else "",
-                shares_outstanding_as_of_date=shares_date,
-                is_shell_company=str(shell).lower() if shell is not None else "",
-                revenue=_fmt(revenue) if revenue is not None else "",
-                revenue_as_of_date=rev_date,
-                revenue_currency=rev_currency or "",
-                last_accessed=now,
-            )
-        ]
+        record = CompanyFactsRecord(
+            company_cik=filing.cik,
+            accession_number=filing.accession_number,
+            form_type=filing.form_type,
+            doc_type=filing.form_type,
+            primary_url=filing.primary_url,
+            filing_date=filing.filing_date,
+            report_date=period_end,
+            company_name=registrant,
+            security_name=security_name,
+            ticker=ticker,
+            exchange=exchange,
+            market_value=_fmt(market_value) if market_value is not None else "",
+            market_value_as_of_date=mv_date,
+            market_value_currency=mv_currency or "",
+            shares_outstanding=_fmt(shares) if shares is not None else "",
+            shares_outstanding_as_of_date=shares_date,
+            is_shell_company=str(shell).lower() if shell is not None else "",
+            revenue=_fmt(revenue) if revenue is not None else "",
+            revenue_as_of_date=rev_date,
+            revenue_currency=rev_currency or "",
+            last_accessed=now,
+        )
+        return [record], failures
 
     def _period_end(self, doc: InlineXbrlDocument) -> datetime.date | None:
         """Return DocumentPeriodEndDate as a date, or None if absent or non-date."""
@@ -180,17 +189,22 @@ class CompanyFactsExtractor:
         self,
         doc: InlineXbrlDocument,
         period_end: datetime.date | None,
-    ) -> tuple[Decimal | None, datetime.date | None, str | None]:
-        """Return (revenue, period end date, currency) for the best matching concept.
+    ) -> tuple[Decimal | None, datetime.date | None, str | None, bool]:
+        """Return (revenue, period end date, currency, is_ambiguous).
 
-        Walks REVENUE_CONCEPTS in priority order. Accepts only facts that are:
-        - dimensionless (excludes segment breakdowns)
-        - ending on period_end (anchors to this filing's fiscal year)
-        - annual duration (340–380 days)
+        Walks REVENUE_CONCEPTS in priority order, collecting the first qualifying
+        fact per concept. A fact qualifies when it is dimensionless, ends on
+        period_end, and covers an annual duration (340–380 days).
+
+        is_ambiguous is True when multiple concepts each yield a qualifying fact
+        and their values disagree. Equal values across concepts are not ambiguous.
+        The priority-order winner is always returned regardless of ambiguity.
         """
         if period_end is None:
-            return None, None, None
+            return None, None, None, False
 
+        # Collect the first qualifying fact per concept in priority order
+        concept_hits: list[tuple[Decimal, datetime.date, str | None]] = []
         for concept in REVENUE_CONCEPTS:
             for fact in doc.facts(concept):
                 if fact.context.has_dimensions:
@@ -204,6 +218,12 @@ class CompanyFactsExtractor:
                     continue
                 if not isinstance(fact.value, Decimal):
                     continue
-                return fact.value, fact.context.end, fact.unit
+                concept_hits.append((fact.value, fact.context.end, fact.unit))
+                break  # first qualifying fact per concept
 
-        return None, None, None
+        if not concept_hits:
+            return None, None, None, False
+
+        winner_value, winner_date, winner_unit = concept_hits[0]
+        is_ambiguous = any(val != winner_value for val, _, _ in concept_hits[1:])
+        return winner_value, winner_date, winner_unit, is_ambiguous

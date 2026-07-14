@@ -6,7 +6,8 @@ from decimal import Decimal
 import pytest
 
 from idi_company_facts.extractor import CompanyFactsExtractor
-from idi_company_facts.types import Filing, PipelineStats
+from idi_company_facts.failures import FailureType
+from idi_company_facts.types import Filing
 from idi_company_facts.xbrl.parser import InlineXbrlDocument
 from tests.conftest import load_fixture, make_ixbrl_bytes
 
@@ -56,7 +57,7 @@ _SHARES_UNIT = '<xbrli:unit id="shares"><xbrli:measure>shares</xbrli:measure></x
 
 @pytest.fixture
 def extractor() -> CompanyFactsExtractor:
-    return CompanyFactsExtractor(stats=PipelineStats())
+    return CompanyFactsExtractor()
 
 
 @pytest.fixture
@@ -75,7 +76,7 @@ class TestExtract:
         fixture_doc: InlineXbrlDocument,
         sample_filing: Filing,
     ) -> None:
-        records = extractor.extract(sample_filing, fixture_doc)
+        records, _ = extractor.extract(sample_filing, fixture_doc)
         assert len(records) == 1
         record = records[0]
         assert record.company_cik == "0000320193"
@@ -100,7 +101,7 @@ class TestExtract:
                 facts='<p><ix:nonFraction name="dei:EntityPublicFloat" contextRef="c-instant" unitRef="USD" decimals="0">1</ix:nonFraction></p>',
             )
         )
-        records = extractor.extract(sample_filing, doc)
+        records, _ = extractor.extract(sample_filing, doc)
         assert records[0].company_name == sample_filing.company_name
 
 
@@ -122,7 +123,7 @@ class TestRevenue:
             )
         )
         period_end = datetime.date(2024, 9, 28)
-        revenue, _, _ = extractor._revenue(doc, period_end)
+        revenue, _, _, _ = extractor._revenue(doc, period_end)
         assert revenue == Decimal("200")
 
     def test_excludes_dimensioned_context(self, extractor: CompanyFactsExtractor) -> None:
@@ -134,7 +135,7 @@ class TestRevenue:
                 facts=facts,
             )
         )
-        revenue, _, _ = extractor._revenue(doc, datetime.date(2024, 9, 28))
+        revenue, _, _, _ = extractor._revenue(doc, datetime.date(2024, 9, 28))
         assert revenue is None
 
     def test_excludes_prior_year(self, extractor: CompanyFactsExtractor) -> None:
@@ -146,7 +147,7 @@ class TestRevenue:
                 facts=facts,
             )
         )
-        revenue, _, _ = extractor._revenue(doc, datetime.date(2024, 9, 28))
+        revenue, _, _, _ = extractor._revenue(doc, datetime.date(2024, 9, 28))
         assert revenue is None
 
     def test_returns_none_when_period_end_absent(self, extractor: CompanyFactsExtractor) -> None:
@@ -157,7 +158,7 @@ class TestRevenue:
                 facts='<p><ix:nonFraction name="us-gaap:Revenues" contextRef="c-duration" unitRef="USD" decimals="0">100</ix:nonFraction></p>',
             )
         )
-        revenue, _, _ = extractor._revenue(doc, period_end=None)
+        revenue, _, _, _ = extractor._revenue(doc, period_end=None)
         assert revenue is None
 
 
@@ -332,3 +333,75 @@ class TestShellCompany:
             )
         )
         assert extractor._shell_company(doc) is None
+
+
+# ── TestExtractionFailures ────────────────────────────────────────────────────
+
+
+class TestExtractionFailures:
+    """Items 6+7: extract() reports non-fatal XBRL failure conditions."""
+
+    def test_missing_period_end_reported(
+        self, extractor: CompanyFactsExtractor, sample_filing: Filing
+    ) -> None:
+        # No dei:DocumentPeriodEndDate → MISSING_PERIOD_END; record still produced.
+        # NO_REVENUE_CONCEPT must NOT also appear (revenue was never queried).
+        doc = InlineXbrlDocument(
+            make_ixbrl_bytes(
+                contexts=_INSTANT_CTX,
+                units=_USD_UNIT,
+                facts='<p><ix:nonFraction name="dei:EntityPublicFloat" contextRef="c-instant" unitRef="USD" decimals="0">1</ix:nonFraction></p>',
+            )
+        )
+        records, failures = extractor.extract(sample_filing, doc)
+        assert len(records) == 1
+        assert FailureType.MISSING_PERIOD_END in failures
+        assert FailureType.NO_REVENUE_CONCEPT not in failures
+
+    def test_no_revenue_concept_reported(
+        self, extractor: CompanyFactsExtractor, sample_filing: Filing
+    ) -> None:
+        # Period end present but no qualifying revenue fact.
+        doc = InlineXbrlDocument(
+            make_ixbrl_bytes(
+                contexts=_DURATION_CTX,
+                facts='<ix:nonNumeric name="dei:DocumentPeriodEndDate" contextRef="c-duration" format="ixt:date-monthname-day-year-en">September 28, 2024</ix:nonNumeric>',
+            )
+        )
+        records, failures = extractor.extract(sample_filing, doc)
+        assert len(records) == 1
+        assert FailureType.NO_REVENUE_CONCEPT in failures
+        assert FailureType.MISSING_PERIOD_END not in failures
+
+    def test_ambiguous_revenue_reported_and_priority_winner_returned(
+        self, extractor: CompanyFactsExtractor, sample_filing: Filing
+    ) -> None:
+        # Two revenue concepts for the same annual period with conflicting values.
+        # Priority winner (RevenueFromContractWithCustomerExcludingAssessedTax = 200)
+        # is returned; AMBIGUOUS_REVENUE is flagged.
+        facts = (
+            '<ix:nonNumeric name="dei:DocumentPeriodEndDate" contextRef="c-duration" format="ixt:date-monthname-day-year-en">September 28, 2024</ix:nonNumeric>'
+            '<ix:nonFraction name="us-gaap:RevenueFromContractWithCustomerExcludingAssessedTax" contextRef="c-duration" unitRef="USD" decimals="0">200</ix:nonFraction>'
+            '<ix:nonFraction name="us-gaap:Revenues" contextRef="c-duration" unitRef="USD" decimals="0">100</ix:nonFraction>'
+        )
+        doc = InlineXbrlDocument(
+            make_ixbrl_bytes(contexts=_DURATION_CTX, units=_USD_UNIT, facts=facts)
+        )
+        records, failures = extractor.extract(sample_filing, doc)
+        assert FailureType.AMBIGUOUS_REVENUE in failures
+        assert Decimal(records[0].revenue) == Decimal("200")  # priority winner
+
+    def test_equal_revenue_values_across_concepts_not_ambiguous(
+        self, extractor: CompanyFactsExtractor, sample_filing: Filing
+    ) -> None:
+        # Two concepts, same value — not ambiguous.
+        facts = (
+            '<ix:nonNumeric name="dei:DocumentPeriodEndDate" contextRef="c-duration" format="ixt:date-monthname-day-year-en">September 28, 2024</ix:nonNumeric>'
+            '<ix:nonFraction name="us-gaap:RevenueFromContractWithCustomerExcludingAssessedTax" contextRef="c-duration" unitRef="USD" decimals="0">300</ix:nonFraction>'
+            '<ix:nonFraction name="us-gaap:Revenues" contextRef="c-duration" unitRef="USD" decimals="0">300</ix:nonFraction>'
+        )
+        doc = InlineXbrlDocument(
+            make_ixbrl_bytes(contexts=_DURATION_CTX, units=_USD_UNIT, facts=facts)
+        )
+        _, failures = extractor.extract(sample_filing, doc)
+        assert FailureType.AMBIGUOUS_REVENUE not in failures

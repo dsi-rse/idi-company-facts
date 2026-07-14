@@ -1,6 +1,7 @@
 """Tests for xbrl.parser — InlineXbrlDocument."""
 
 import datetime
+import logging
 from decimal import Decimal
 
 import pytest
@@ -274,3 +275,95 @@ class TestSingleFact:
         )
         doc = InlineXbrlDocument(make_ixbrl_bytes(contexts=two_ctxs, facts=facts))
         assert doc.single_fact("dei:EntityRegistrantName").value == "FIRST"
+
+
+# ── TestSingleTraversal ───────────────────────────────────────────────────────
+
+
+class TestSingleTraversal:
+    """Item 1: _parse_all_facts returns saw_ix before filtering; semantics check."""
+
+    def test_ix_element_with_unresolvable_context_does_not_raise(self) -> None:
+        # ix:nonFraction references "c-missing" which is not declared — fact is
+        # dropped by the context-resolution filter, but saw_ix is still True
+        # because the element was encountered before the filter ran.
+        doc = InlineXbrlDocument(
+            make_ixbrl_bytes(
+                contexts=_INSTANT_CTX,
+                units=_USD_UNIT,
+                facts=(
+                    # dropped fact (unresolvable context)
+                    '<p><ix:nonFraction name="dei:EntityPublicFloat" contextRef="c-missing" unitRef="USD" decimals="0">1</ix:nonFraction></p>'
+                    # valid fact — ensures the document produces at least one parseable fact
+                    '<p><ix:nonFraction name="dei:EntityPublicFloat" contextRef="c-instant" unitRef="USD" decimals="0">2</ix:nonFraction></p>'
+                ),
+            )
+        )
+        # No NotInlineXbrlError despite the dropped fact
+        assert doc.single_fact("dei:EntityPublicFloat") is not None
+
+    def test_all_ix_elements_dropped_still_not_raises(self) -> None:
+        # Every ix: element references an unresolvable context — saw_ix is True
+        # because elements were encountered, even though _fact_cache is empty.
+        doc = InlineXbrlDocument(
+            make_ixbrl_bytes(
+                contexts=_INSTANT_CTX,
+                units=_USD_UNIT,
+                facts='<p><ix:nonFraction name="dei:EntityPublicFloat" contextRef="c-missing" unitRef="USD" decimals="0">1</ix:nonFraction></p>',
+            )
+        )
+        # saw_ix was True — NotInlineXbrlError must NOT be raised
+        assert doc.facts("dei:EntityPublicFloat") == []
+
+    def test_zero_ix_elements_raises_not_inline(self) -> None:
+        # No ix: elements at all → saw_ix stays False → NotInlineXbrlError
+        html = b"<?xml version='1.0'?><html xmlns='http://www.w3.org/1999/xhtml'><body><p>hello</p></body></html>"
+        with pytest.raises(NotInlineXbrlError):
+            InlineXbrlDocument(html)
+
+
+# ── TestHtmlEntitiesRecovery ──────────────────────────────────────────────────
+
+
+def _make_nbsp_ixbrl_bytes() -> bytes:
+    """IXBRL document containing &nbsp; in body text, which breaks strict XML parsing."""
+    base = make_ixbrl_bytes(
+        contexts=_INSTANT_CTX,
+        units=_USD_UNIT,
+        facts='<p><ix:nonFraction name="dei:EntityPublicFloat" contextRef="c-instant" unitRef="USD" decimals="0">1000</ix:nonFraction></p>',
+    )
+    # Inject bare HTML entity (invalid in strict XML without a DTD)
+    return base.replace(b"</body>", b"<p>text&nbsp;with&nbsp;entities</p></body>")
+
+
+class TestHtmlEntitiesRecovery:
+    """Item 8: strict XML parse failure triggers lxml recovery parser."""
+
+    def test_nbsp_document_parses_via_recovery(self) -> None:
+        doc = InlineXbrlDocument(_make_nbsp_ixbrl_bytes())
+        assert doc.used_recovery_parser is True
+        # Numeric fact is unaffected by entity removal
+        assert doc.single_fact("dei:EntityPublicFloat").value == Decimal("1000")
+
+    def test_recovery_logs_warning(self, caplog: pytest.LogCaptureFixture) -> None:
+        with caplog.at_level(logging.WARNING):
+            InlineXbrlDocument(_make_nbsp_ixbrl_bytes())
+        assert any("recovered" in msg.lower() for msg in caplog.messages)
+
+    def test_garbage_bytes_still_raises_xbrl_parse_error(self) -> None:
+        with pytest.raises(XbrlParseError):
+            InlineXbrlDocument(b"\x00\xff\xfe garbage not xml")
+
+    def test_well_formed_document_does_not_use_recovery(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        with caplog.at_level(logging.WARNING):
+            doc = InlineXbrlDocument(
+                make_ixbrl_bytes(
+                    contexts=_INSTANT_CTX,
+                    units=_USD_UNIT,
+                    facts='<p><ix:nonFraction name="dei:EntityPublicFloat" contextRef="c-instant" unitRef="USD" decimals="0">1</ix:nonFraction></p>',
+                )
+            )
+        assert doc.used_recovery_parser is False
+        assert not any("recovered" in msg.lower() for msg in caplog.messages)

@@ -118,7 +118,7 @@ class CompanyFactsPipeline(Pipeline):
 
     # Matches 10-K, 10K, 10-K/A, 10K/A, 10-KT, 10KT, 10-KT/A, 10KT/A — case-insensitive.
     _PRIMARY_TYPE_RE: re.Pattern[str] = re.compile(r"^10-?KT?(/A)?$", re.IGNORECASE)
-    _LOG_EVERY = 5
+    _LOG_EVERY = 100
 
     def __init__(self, config: PipelineConfig) -> None:
         """Initialise the pipeline with config and a failure registry.
@@ -133,7 +133,7 @@ class CompanyFactsPipeline(Pipeline):
             classifier=CompanyFactsFailureClassifier(),
             flush_every=config.failure_flush_every,
         )
-        self.extractor = CompanyFactsExtractor(stats=self.stats)
+        self.extractor = CompanyFactsExtractor()
 
     def run(self) -> None:
         """Run the pipeline, flushing any buffered failures on completion."""
@@ -197,53 +197,52 @@ class CompanyFactsPipeline(Pipeline):
         typed = [d for d in scraped_filing.documents if cls._PRIMARY_TYPE_RE.match(d.type or "")]
         return typed[0] if typed else None
 
-    def _extract_worker(self, work_queue: queue.Queue, results_queue: queue.Queue) -> None:
-        """Worker thread that fetches and parses one filing's primary document.
+    def _extract_worker(
+        self,
+        work_queue: queue.Queue,
+        records: list[CompanyFactsRecord],
+        records_lock: threading.Lock,
+        total: int,
+    ) -> None:
+        """Worker thread that fetches, parses, and extracts facts for one filing.
 
         Runs as a daemon thread, consuming :class:`Filing` objects from
-        ``work_queue`` and posting extracted :class:`CompanyFactsRecord` results
-        to ``results_queue``. Multi-class filings produce one record per security.
+        ``work_queue`` and appending extracted :class:`CompanyFactsRecord` results
+        directly to the shared ``records`` list under ``records_lock``.
         Failures are recorded inside :meth:`_process_one` so the worker loop
         always continues.
 
         Args:
             work_queue: Queue of :class:`Filing` objects to process.
-            results_queue: Queue to which successfully extracted
-                :class:`CompanyFactsRecord` objects are posted.
+            records: Shared list to which successfully extracted records are appended.
+            records_lock: Lock protecting ``records``.
+            total: Total number of filings queued, used for progress logging.
         """
         while True:
             filing = work_queue.get()
             try:
-                for record in self._process_one(filing):
-                    results_queue.put(record)
+                new_records = self._process_one(filing)
+                with records_lock:
+                    records.extend(new_records)
+                self.stats.increment("filings_processed")
+                n = self.stats.filings_processed  # approximate read outside the lock
+                if n % self._LOG_EVERY == 0:
+                    self.logger.info(
+                        "progress: %d/%d filings processed (%d extracted, %d failed)",
+                        n,
+                        total,
+                        self.stats.extracted_documents,
+                        self.stats.parse_failures + self.stats.storage_errors,
+                    )
             finally:
                 work_queue.task_done()
-
-    def _results_worker(
-        self, results_queue: queue.Queue, records: list[CompanyFactsRecord]
-    ) -> None:
-        """Worker thread that collects extracted records from the results queue.
-
-        Runs as a daemon thread, appending each :class:`CompanyFactsRecord`
-        from ``results_queue`` to the shared ``records`` list.
-
-        Args:
-            results_queue: Queue of :class:`CompanyFactsRecord` objects produced
-                by :meth:`_extract_worker`.
-            records: Shared list to which records are appended. Only this thread
-                writes to it.
-        """
-        while True:
-            record = results_queue.get()
-            records.append(record)
-            results_queue.task_done()
 
     def process(self, input_list: list[Filing]) -> list[CompanyFactsRecord]:
         """Fetch each filing's primary document from S3 and extract company facts.
 
         Extraction runs across :attr:`~PipelineConfig.num_workers` daemon threads.
-        The main thread feeds filings into a bounded work queue; a single results
-        thread collects completed records.
+        The main thread feeds filings into a bounded work queue; workers append
+        extracted records directly to the shared result list.
 
         Args:
             input_list: Filings returned by :meth:`load_input`.
@@ -252,13 +251,19 @@ class CompanyFactsPipeline(Pipeline):
             Extracted :class:`CompanyFactsRecord` objects (failures are excluded).
         """
         work_queue: queue.Queue = queue.Queue(maxsize=self.config.num_workers * 2)
-        results_queue: queue.Queue = queue.Queue()
         records: list[CompanyFactsRecord] = []
+        records_lock = threading.Lock()
+
+        self.logger.info(
+            "starting process stage: %d filings queued, %d workers",
+            len(input_list),
+            self.config.num_workers,
+        )
 
         extract_workers = [
             threading.Thread(
                 target=self._extract_worker,
-                args=(work_queue, results_queue),
+                args=(work_queue, records, records_lock, len(input_list)),
                 daemon=True,
                 name=f"extract-worker-{i}",
             )
@@ -267,19 +272,11 @@ class CompanyFactsPipeline(Pipeline):
         for worker in extract_workers:
             worker.start()
 
-        threading.Thread(
-            target=self._results_worker,
-            args=(results_queue, records),
-            daemon=True,
-            name="results-worker",
-        ).start()
-
         for filing in input_list:
             work_queue.put(filing)
             self.stats.increment("queued_documents")
 
         work_queue.join()
-        results_queue.join()
 
         return records
 
@@ -297,7 +294,17 @@ class CompanyFactsPipeline(Pipeline):
                 return []
             self.stats.increment("documents_fetched")
             doc = InlineXbrlDocument(html_bytes)
-            records = self.extractor.extract(filing, doc)
+            if doc.used_recovery_parser:
+                self.stats.increment("recovered_parse")
+            records, extraction_failures = self.extractor.extract(filing, doc)
+            for failure_type in extraction_failures:
+                self.failures.add((filing.cik, filing.accession_number), failure_type)
+                if failure_type == FailureType.MISSING_PERIOD_END:
+                    self.stats.increment("missing_period_end")
+                elif failure_type == FailureType.NO_REVENUE_CONCEPT:
+                    self.stats.increment("no_revenue_concept")
+                elif failure_type == FailureType.AMBIGUOUS_REVENUE:
+                    self.stats.increment("ambiguous_revenue")
             self.stats.increment("extracted_documents", len(records))
             return records
         except NotInlineXbrlError:
@@ -347,4 +354,9 @@ class CompanyFactsPipeline(Pipeline):
         self.logger.info("    Extracted:          %d", self.stats.extracted_documents)
         self.logger.info("    Parse failures:     %d", self.stats.parse_failures)
         self.logger.info("    Storage errors:     %d", self.stats.storage_errors)
+        self.logger.info("    Recovery parses:    %d", self.stats.recovered_parse)
+        self.logger.info("  Extraction Quality")
+        self.logger.info("    Missing period end: %d", self.stats.missing_period_end)
+        self.logger.info("    No revenue concept: %d", self.stats.no_revenue_concept)
+        self.logger.info("    Ambiguous revenue:  %d", self.stats.ambiguous_revenue)
         self.logger.info("=" * 40)

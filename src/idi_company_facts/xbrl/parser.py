@@ -2,10 +2,12 @@
 
 import datetime
 import re
-from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 
+from idi_ftm2j_shared.logs import get_logger
 from lxml import etree
+
+from idi_company_facts.types import Context, Fact
 
 # Namespace URIs
 _XBRLI_NS = "http://www.xbrl.org/2003/instance"
@@ -23,6 +25,8 @@ _IXT_DATE_PREFIX = "ixt:date-"
 # Date formats commonly used in SEC iXBRL filings
 _DATE_FORMATS = ("%B %d, %Y", "%b %d, %Y", "%Y-%m-%d")
 
+_logger = get_logger(__name__)
+
 
 class XbrlParseError(Exception):
     """Raised when a document cannot be parsed as iXBRL."""
@@ -32,31 +36,10 @@ class NotInlineXbrlError(XbrlParseError):
     """Raised when the document is valid XML/HTML but contains no ix:* tags."""
 
 
-@dataclass(frozen=True)
-class Context:
-    """An iXBRL reporting context."""
-
-    context_id: str
-    instant: datetime.date | None
-    start: datetime.date | None
-    end: datetime.date | None
-    has_dimensions: bool
-
-
-@dataclass(frozen=True)
-class Fact:
-    """A single iXBRL fact with a normalized concept name and typed value."""
-
-    concept: str  # canonical "prefix:LocalName" e.g. "dei:DocumentPeriodEndDate"
-    value: Decimal | bool | datetime.date | str
-    context: Context
-    unit: str | None  # ISO 4217 currency, "shares", or None
-
-
 class InlineXbrlDocument:
     """Parsed inline XBRL document.
 
-    Contexts and units are parsed eagerly; facts are parsed on first access.
+    All parsing (contexts, units, and facts) happens eagerly in ``__init__``.
     """
 
     def __init__(self, html_bytes: bytes) -> None:
@@ -71,25 +54,27 @@ class InlineXbrlDocument:
         """
         if not html_bytes:
             raise XbrlParseError("empty document")
+
+        self.used_recovery_parser = False
         try:
             root = etree.fromstring(html_bytes)
-        except etree.XMLSyntaxError as exc:
-            raise XbrlParseError(str(exc)) from exc
+        except etree.XMLSyntaxError:
+            try:
+                root = etree.fromstring(html_bytes, parser=etree.XMLParser(recover=True))
+            except etree.XMLSyntaxError as exc:
+                raise XbrlParseError(str(exc)) from exc
+            if root is None:
+                raise XbrlParseError("unparseable document even in recovery mode") from None
+            _logger.warning("strict XML parse failed; recovered with lenient parser")
+            self.used_recovery_parser = True
 
         self._prefix_map = _build_prefix_map(root.nsmap)
         self._contexts = _parse_contexts(root)
         self._units = _parse_units(root)
-        self._root = root
-        self._fact_cache: dict[str, list[Fact]] | None = None
-
-        has_ix = any(
-            True
-            for _ in root.iter(
-                f"{{{_IX_NS}}}nonFraction",
-                f"{{{_IX_NS}}}nonNumeric",
-            )
+        self._fact_cache, saw_ix = _parse_all_facts(
+            root, self._prefix_map, self._contexts, self._units
         )
-        if not has_ix:
+        if not saw_ix:
             raise NotInlineXbrlError("no ix:nonFraction or ix:nonNumeric elements found")
 
     def facts(self, concept: str) -> list[Fact]:
@@ -101,10 +86,6 @@ class InlineXbrlDocument:
         Returns:
             List of matching :class:`Fact` objects; empty if none found.
         """
-        if self._fact_cache is None:
-            self._fact_cache = _parse_all_facts(
-                self._root, self._prefix_map, self._contexts, self._units
-            )
         return self._fact_cache.get(concept, [])
 
     def single_fact(self, concept: str, *, dimensionless: bool = True) -> "Fact | None":
@@ -251,14 +232,23 @@ def _parse_all_facts(
     prefix_map: dict[str, str],
     contexts: dict[str, Context],
     units: dict[str, str],
-) -> dict[str, list[Fact]]:
-    """Build a canonical concept → [Fact, ...] mapping from the document tree."""
+) -> tuple[dict[str, list[Fact]], bool]:
+    """Build a canonical concept → [Fact, ...] mapping from the document tree.
+
+    Returns:
+        Tuple of (fact_cache, saw_ix) where saw_ix is True if any ix:nonFraction
+        or ix:nonNumeric element was encountered, even if it was later dropped by
+        filtering (e.g. unresolvable context).
+    """
     result: dict[str, list[Fact]] = {}
+    saw_ix = False
 
     for el in root.iter(
         f"{{{_IX_NS}}}nonFraction",
         f"{{{_IX_NS}}}nonNumeric",
     ):
+        saw_ix = True  # set before any filtering — existence of the element is enough
+
         raw_name = el.get("name", "")
         concept = _normalize_concept(raw_name, prefix_map)
         ctx_id = el.get("contextRef", "")
@@ -281,4 +271,4 @@ def _parse_all_facts(
             Fact(concept=concept, value=value, context=context, unit=unit)
         )
 
-    return result
+    return result, saw_ix
