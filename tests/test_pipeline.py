@@ -1,5 +1,6 @@
 """Tests for CompanyFactsPipeline.load_input and _select_primary_document."""
 
+import datetime
 from datetime import date
 
 import pytest
@@ -7,7 +8,38 @@ from idi_ftm2j_shared.types import ScrapedDocument, ScrapedFiling
 from pytest_mock import MockerFixture
 
 from idi_company_facts.pipeline import CompanyFactsPipeline
-from idi_company_facts.types import PipelineConfig
+from idi_company_facts.types import Filing, PipelineConfig
+from tests.conftest import make_ixbrl_bytes
+
+# ── Shared iXBRL building blocks for process() tests ──────────────────────────
+
+_INSTANT_CTX = """
+<xbrli:context id="c-instant">
+  <xbrli:entity><xbrli:identifier scheme="http://www.sec.gov/CIK">0001234567</xbrli:identifier></xbrli:entity>
+  <xbrli:period><xbrli:instant>2024-09-28</xbrli:instant></xbrli:period>
+</xbrli:context>
+"""
+_USD_UNIT = '<xbrli:unit id="USD"><xbrli:measure>iso4217:USD</xbrli:measure></xbrli:unit>'
+
+_MINIMAL_IXBRL = make_ixbrl_bytes(
+    contexts=_INSTANT_CTX,
+    units=_USD_UNIT,
+    facts='<p><ix:nonFraction name="dei:EntityPublicFloat" contextRef="c-instant" unitRef="USD" decimals="0">1000</ix:nonFraction></p>',
+)
+
+
+def _make_filing(i: int) -> Filing:
+    """Return a minimal Filing with unique CIK and accession number."""
+    return Filing(
+        cik=str(i).zfill(10),
+        accession_number=f"{str(i).zfill(10)}-24-000001",
+        form_type="10-K",
+        filing_date=datetime.date(2024, 1, 15),
+        primary_s3_key=f"s3://bucket/filing_{i}.htm",
+        primary_url=f"https://sec.gov/filing_{i}.htm",
+        company_name=f"Corp {i}",
+    )
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -264,27 +296,29 @@ class TestRun:
 
         assert (no_doc.cik, no_doc.accession_number) in pipeline.failures
 
-    def test_process_raises_when_filings_present(
+    def test_process_called_when_filings_present(
         self, pipeline: CompanyFactsPipeline, mocker: MockerFixture
     ) -> None:
-        """process() is called (and raises NotImplementedError) when filings are found."""
+        """process() is invoked for each valid filing returned by load_input."""
         good = make_manifest()
         mocker.patch(
             "idi_company_facts.pipeline.iter_filings_by_form_type",
             return_value=iter([good]),
         )
+        process_one = mocker.patch.object(pipeline, "_process_one", return_value=[])
 
-        with pytest.raises(NotImplementedError):
-            pipeline.run()
+        pipeline.run()
+
+        process_one.assert_called_once()
 
     def test_failures_flushed_even_when_process_raises(
         self, pipeline: CompanyFactsPipeline, mocker: MockerFixture
     ) -> None:
-        """Failures from load_input are flushed even when process() later raises.
+        """Failures from load_input are persisted even when process() raises.
 
         Provide both a no-primary-doc manifest (records MISSING_DOCUMENT) and a
         good manifest (causes process() to be invoked).  The MISSING_DOCUMENT
-        failure must survive the NotImplementedError from the stub.
+        failure must be flushed despite the RuntimeError from process.
         """
         no_doc = make_manifest(
             cik="1111111111",
@@ -299,8 +333,9 @@ class TestRun:
             "idi_company_facts.pipeline.iter_filings_by_form_type",
             return_value=iter([no_doc, good]),
         )
+        mocker.patch.object(pipeline, "process", side_effect=RuntimeError("boom"))
 
-        with pytest.raises(NotImplementedError):
+        with pytest.raises(RuntimeError):
             pipeline.run()
 
         assert (no_doc.cik, no_doc.accession_number) in pipeline.failures
@@ -354,3 +389,80 @@ class TestDisplayStats:
         assert any("Filings" in arg for arg in logged_args)
         assert any("Primary Documents" in arg for arg in logged_args)
         assert any("=" in arg for arg in logged_args)
+
+    def test_logs_extraction_quality_counts(
+        self, pipeline: CompanyFactsPipeline, mocker: MockerFixture
+    ) -> None:
+        """New extraction quality counters appear in display_stats output."""
+        pipeline.stats.increment("missing_period_end", 3)
+        pipeline.stats.increment("no_revenue_concept", 5)
+        pipeline.stats.increment("ambiguous_revenue", 1)
+        mock_logger = mocker.patch.object(pipeline, "logger")
+
+        pipeline.display_stats()
+
+        logged = " ".join(str(c) for c in mock_logger.info.call_args_list)
+        assert "3" in logged
+        assert "5" in logged
+        assert "1" in logged
+        assert any("Extraction Quality" in str(c) for c in mock_logger.info.call_args_list)
+
+
+# ---------------------------------------------------------------------------
+# process() — concurrency and progress logging
+# ---------------------------------------------------------------------------
+
+
+class TestProcess:
+    """Tests for CompanyFactsPipeline.process() threading and progress logging."""
+
+    def test_no_lost_or_duplicate_records(
+        self,
+        pipeline: CompanyFactsPipeline,
+        mocker: MockerFixture,
+    ) -> None:
+        """Exact record count is preserved under concurrent extraction (Items 3+6+7)."""
+        mocker.patch("idi_company_facts.pipeline.load_content", return_value=_MINIMAL_IXBRL)
+        n = 50
+        filings = [_make_filing(i) for i in range(n)]
+
+        # Use 4 workers to stress thread-safety of the direct-append pattern
+        pipeline.config.num_workers = 4
+        # Re-create workers list is part of process(), not init — just update config
+        records = pipeline.process(filings)
+
+        assert len(records) == n
+
+    def test_process_logs_stage_start(
+        self,
+        pipeline: CompanyFactsPipeline,
+        mocker: MockerFixture,
+    ) -> None:
+        """process() logs total filings and worker count at stage start."""
+        mocker.patch("idi_company_facts.pipeline.load_content", return_value=_MINIMAL_IXBRL)
+        mock_logger = mocker.patch.object(pipeline, "logger")
+        filings = [_make_filing(0)]
+
+        pipeline.process(filings)
+
+        start_calls = [
+            c for c in mock_logger.info.call_args_list if "starting process stage" in str(c)
+        ]
+        assert start_calls, "expected a 'starting process stage' log line"
+
+    def test_process_logs_progress_at_log_every(
+        self,
+        pipeline: CompanyFactsPipeline,
+        mocker: MockerFixture,
+    ) -> None:
+        """A progress line is emitted after every _LOG_EVERY filings processed."""
+        mocker.patch("idi_company_facts.pipeline.load_content", return_value=_MINIMAL_IXBRL)
+        mock_logger = mocker.patch.object(pipeline, "logger")
+
+        pipeline._LOG_EVERY = 3  # override for test
+        filings = [_make_filing(i) for i in range(4)]
+
+        pipeline.process(filings)
+
+        progress_calls = [c for c in mock_logger.info.call_args_list if "progress:" in str(c)]
+        assert progress_calls, "expected at least one progress log line"

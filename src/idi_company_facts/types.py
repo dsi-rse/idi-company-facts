@@ -4,9 +4,31 @@ import datetime
 import threading
 from dataclasses import dataclass
 from datetime import date
+from decimal import Decimal
 
 # Single source of truth for which filings carry a primary document
 TARGET_FORM_TYPES = ["10-K", "10-K/A", "10-KT", "10-KT/A"]
+
+
+@dataclass(frozen=True)
+class Context:
+    """An iXBRL reporting context."""
+
+    context_id: str
+    instant: datetime.date | None
+    start: datetime.date | None
+    end: datetime.date | None
+    has_dimensions: bool
+
+
+@dataclass(frozen=True)
+class Fact:
+    """A single iXBRL fact with a normalized concept name and typed value."""
+
+    concept: str  # canonical "prefix:LocalName" e.g. "dei:DocumentPeriodEndDate"
+    value: Decimal | bool | datetime.date | str
+    context: Context
+    unit: str | None  # ISO 4217 currency, "shares", or None
 
 
 @dataclass(frozen=True, slots=True)
@@ -39,12 +61,23 @@ class PipelineConfig:
 class PipelineStats:
     """Thread-safe counters tracking pipeline progress and failures."""
 
+    # load_input counters
     total_filings: int = 0
     failed_filings: int = 0
     total_primary_docs: int = 0
     failed_primary_docs: int = 0
-    timeout_primary_docs: int = 0
+    # process counters
+    queued_documents: int = 0
+    documents_fetched: int = 0
     extracted_documents: int = 0
+    parse_failures: int = 0
+    storage_errors: int = 0
+    filings_processed: int = 0
+    # extraction quality counters
+    missing_period_end: int = 0
+    no_revenue_concept: int = 0
+    ambiguous_revenue: int = 0
+    recovered_parse: int = 0
 
     def __post_init__(self) -> None:
         """Initialize the pipeline stats."""
@@ -73,9 +106,9 @@ class CompanyFactsRecord:
     filing_date: date | None = None
     report_date: date | None = None  # Fiscal year end of the report
     company_name: str = ""
-    tickers: str = ""
-    securities: str = ""
-    exchanges: str = ""
+    security_name: str = ""
+    ticker: str = ""
+    exchange: str = ""
     market_value: str = ""
     market_value_as_of_date: date | None = None
     market_value_currency: str = ""
