@@ -155,7 +155,6 @@ def get_args() -> argparse.Namespace:
 
 def main() -> None:
     """Run the company facts pipeline from the CLI."""
-    start = datetime.datetime.now()
     args = get_args()
 
     logger = get_logger("orchestrator")
@@ -177,9 +176,6 @@ def main() -> None:
 
     pipeline = CompanyFactsPipeline(config)
     pipeline.run()
-
-    end = datetime.datetime.now()
-    print(f"Elapsed time: {end - start}")
 
 
 if __name__ == "__main__":

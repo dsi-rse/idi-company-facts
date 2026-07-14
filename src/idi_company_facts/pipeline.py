@@ -98,9 +98,9 @@ class Pipeline(ABC):
         if input_data:
             results = self.process(input_data)
             self.save_output(results)
-            self.display_stats()
         else:
             self.logger.info("No primary documents found, skipping pipeline")
+        self.display_stats()
 
         end_time = datetime.datetime.now()
         self.logger.info("Elapsed time: %s", end_time - start_time)
@@ -173,6 +173,7 @@ class CompanyFactsPipeline(Pipeline):
                     cik=scraped_filing.cik,
                     accession_number=scraped_filing.accession_number,
                     form_type=scraped_filing.form_type,
+                    # filing_date is always ISO YYYY-MM-DD as guaranteed by the shared scraper library
                     filing_date=datetime.date.fromisoformat(scraped_filing.filing_date),
                     primary_s3_key=doc.s3_key,
                     primary_url=doc.url,
@@ -185,9 +186,15 @@ class CompanyFactsPipeline(Pipeline):
 
     @classmethod
     def _select_primary_document(cls, scraped_filing: ScrapedFiling) -> ScrapedDocument | None:
-        """Return the primary 10-K document from the filing, or None if absent."""
+        """Return the primary 10-K document from the filing, or None if absent.
+
+        When multiple typed documents exist, the one with the lowest numeric
+        sequence number is preferred (SEC seq="1" denotes the primary document).
+        """
         typed = [d for d in scraped_filing.documents if cls._PRIMARY_TYPE_RE.match(d.type or "")]
-        return typed[0] if typed else None
+        if not typed:
+            return None
+        return min(typed, key=lambda d: int(d.seq) if d.seq and d.seq.isdigit() else float("inf"))
 
     def process(self, input_list: list[Filing]) -> list[CompanyFactsRecord]:
         """Fetch and parse each filing's primary document; return extracted records.
