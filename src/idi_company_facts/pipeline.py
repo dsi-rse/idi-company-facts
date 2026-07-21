@@ -1,6 +1,7 @@
 """Pipeline for the company facts processor."""
 
 # Standard application imports
+import csv
 import datetime
 import queue
 import re
@@ -26,6 +27,31 @@ from idi_company_facts.types import (
     PipelineStats,
 )
 from idi_company_facts.xbrl.parser import InlineXbrlDocument, NotInlineXbrlError, XbrlParseError
+
+
+def load_allow_list(
+    csv_path: str,
+) -> dict[datetime.date, frozenset[tuple[str, str]]]:
+    """Build a filing_date → {(cik, accession_number)} allow-list from a CSV.
+
+    The CSV must have 'cik', 'accession_number', and 'filing_date' columns.
+    Pass the result to ``PipelineConfig.allow_list`` to restrict processing to
+    exactly those filings, scanning only the S3 dates that appear in the CSV.
+
+    Args:
+        csv_path: Path to the CSV file.
+
+    Returns:
+        Dict mapping each filing date to the frozenset of (cik, accession_number)
+        pairs filed on that date.
+    """
+    groups: dict[datetime.date, set[tuple[str, str]]] = {}
+    with open(csv_path, newline="") as f:
+        for row in csv.DictReader(f):
+            date = datetime.date.fromisoformat(row["filing_date"].strip())
+            key = (row["cik"].strip(), row["accession_number"].strip())
+            groups.setdefault(date, set()).add(key)
+    return {date: frozenset(keys) for date, keys in groups.items()}
 
 
 class Pipeline(ABC):
@@ -151,16 +177,50 @@ class CompanyFactsPipeline(Pipeline):
         Returns:
             A list of Filing objects that have associated primary documents
         """
+        filings: list[Filing] = []
+
+        if self.config.allow_list is not None:
+            for filing_date, keys in self.config.allow_list.items():
+                self._collect_filings(filing_date, filing_date, keys, filings)
+        else:
+            self._collect_filings(
+                self.config.start_date, self.config.end_date, None, filings
+            )
+
+        self.stats.increment("total_primary_docs", len(filings))
+        return filings
+
+    def _collect_filings(
+        self,
+        start_date: datetime.date,
+        end_date: datetime.date,
+        keys: frozenset[tuple[str, str]] | None,
+        filings: list[Filing],
+    ) -> None:
+        """Fetch scraped filings for a date window and append matching Filing objects.
+
+        Args:
+            start_date: Start of the filing date window (inclusive).
+            end_date: End of the filing date window (inclusive).
+            keys: If set, only (cik, accession_number) pairs in this frozenset are
+                included. None means include all.
+            filings: List to append results to.
+        """
         scraped_filings = iter_filings_by_form_type(
-            form_types=TARGET_FORM_TYPES,
-            start_date=self.config.start_date,
-            end_date=self.config.end_date,
+            form_types=self.config.form_types or TARGET_FORM_TYPES,
+            start_date=start_date,
+            end_date=end_date,
             bucket=self.config.sec_bucket,
             include_failures=True,
         )
 
-        filings: list[Filing] = []
         for scraped_filing in scraped_filings:
+            if keys is not None and (
+                scraped_filing.cik,
+                scraped_filing.accession_number,
+            ) not in keys:
+                continue
+
             self.stats.increment("total_filings")
 
             if scraped_filing.failure_reason:
@@ -188,9 +248,6 @@ class CompanyFactsPipeline(Pipeline):
                     company_name=scraped_filing.company_name,
                 )
             )
-
-        self.stats.increment("total_primary_docs", len(filings))
-        return filings
 
     @classmethod
     def _select_primary_document(cls, scraped_filing: ScrapedFiling) -> ScrapedDocument | None:
@@ -295,6 +352,7 @@ class CompanyFactsPipeline(Pipeline):
         s3_url = filing.primary_s3_key  # manifest s3_key is already a full s3:// URL
         try:
             html_bytes = load_content(s3_url)
+            # add a error check for a file that does not exist `b""``
             if not html_bytes:
                 self.failures.add((filing.cik, filing.accession_number), FailureType.EMPTY_DOCUMENT)
                 self.stats.increment("storage_errors")

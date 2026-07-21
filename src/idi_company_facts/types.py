@@ -19,6 +19,7 @@ class Context:
     start: datetime.date | None
     end: datetime.date | None
     has_dimensions: bool
+    dimension_members: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -55,6 +56,8 @@ class PipelineConfig:
     end_date: datetime.date
     failure_flush_every: int = 50
     num_workers: int = 10
+    allow_list: dict[datetime.date, frozenset[tuple[str, str]]] | None = None
+    form_types: tuple[str, ...] | None = None
 
 
 @dataclass

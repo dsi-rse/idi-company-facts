@@ -25,6 +25,7 @@ def make_ixbrl_bytes(
     facts: str = "",
     dei_prefix: str = "dei",
     usgaap_prefix: str = "us-gaap",
+    ixt_ns: str = "http://www.xbrl.org/inlineXBRL/transformation/2020-02-12",
 ) -> bytes:
     """Build minimal iXBRL XHTML bytes for use in unit tests.
 
@@ -34,6 +35,8 @@ def make_ixbrl_bytes(
         facts: XML string of ix:nonFraction/ix:nonNumeric elements to inject.
         dei_prefix: Namespace prefix for the DEI taxonomy (default ``dei``).
         usgaap_prefix: Namespace prefix for the US-GAAP taxonomy (default ``us-gaap``).
+        ixt_ns: Namespace URI bound to the ``ixt`` prefix.  Defaults to the TR4
+            URI.  Pass the TR3 URI to test 2015-era date transforms.
 
     Returns:
         Bytes of a well-formed iXBRL XHTML document.
@@ -42,6 +45,8 @@ def make_ixbrl_bytes(
 <html
   xmlns="http://www.w3.org/1999/xhtml"
   xmlns:ix="http://www.xbrl.org/2013/inlineXBRL"
+  xmlns:ixt="{ixt_ns}"
+  xmlns:ixt-sec="http://www.sec.gov/inlineXBRL/transformation/2015-08-31"
   xmlns:xbrli="http://www.xbrl.org/2003/instance"
   xmlns:xbrldi="http://xbrl.org/2006/xbrldi"
   xmlns:{dei_prefix}="http://xbrl.sec.gov/dei/2024"
