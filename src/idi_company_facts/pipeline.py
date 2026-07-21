@@ -8,6 +8,7 @@ import re
 import threading
 from abc import ABC, abstractmethod
 from dataclasses import asdict
+from pathlib import Path
 
 # Third party imports
 import pandas as pd
@@ -46,7 +47,7 @@ def load_allow_list(
         pairs filed on that date.
     """
     groups: dict[datetime.date, set[tuple[str, str]]] = {}
-    with open(csv_path, newline="") as f:
+    with Path(csv_path).open(newline="") as f:
         for row in csv.DictReader(f):
             date = datetime.date.fromisoformat(row["filing_date"].strip())
             key = (row["cik"].strip(), row["accession_number"].strip())
@@ -352,7 +353,6 @@ class CompanyFactsPipeline(Pipeline):
         s3_url = filing.primary_s3_key  # manifest s3_key is already a full s3:// URL
         try:
             html_bytes = load_content(s3_url)
-            # add a error check for a file that does not exist `b""``
             if not html_bytes:
                 self.failures.add((filing.cik, filing.accession_number), FailureType.EMPTY_DOCUMENT)
                 self.stats.increment("storage_errors")
