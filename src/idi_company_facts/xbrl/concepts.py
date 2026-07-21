@@ -17,8 +17,8 @@ SECURITY_12B_TITLE = "dei:Security12bTitle"
 # The Including/Excluding assessed-tax pair is placed adjacent so that filers
 # tagging only one of them are handled correctly.
 REVENUE_CONCEPTS: tuple[str, ...] = (
-    "us-gaap:Revenues",                                              # broad total — preferred
-    "us-gaap:RevenueFromContractWithCustomerExcludingAssessedTax",   # ASC 606 excl. tax
-    "us-gaap:RevenueFromContractWithCustomerIncludingAssessedTax",   # ASC 606 incl. tax
-    "us-gaap:SalesRevenueNet",                                       # deprecated 2018
+    "us-gaap:Revenues",  # broad total — preferred
+    "us-gaap:RevenueFromContractWithCustomerExcludingAssessedTax",  # ASC 606 excl. tax
+    "us-gaap:RevenueFromContractWithCustomerIncludingAssessedTax",  # ASC 606 incl. tax
+    "us-gaap:SalesRevenueNet",  # deprecated 2018
 )

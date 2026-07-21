@@ -184,9 +184,7 @@ class CompanyFactsPipeline(Pipeline):
             for filing_date, keys in self.config.allow_list.items():
                 self._collect_filings(filing_date, filing_date, keys, filings)
         else:
-            self._collect_filings(
-                self.config.start_date, self.config.end_date, None, filings
-            )
+            self._collect_filings(self.config.start_date, self.config.end_date, None, filings)
 
         self.stats.increment("total_primary_docs", len(filings))
         return filings
@@ -216,10 +214,14 @@ class CompanyFactsPipeline(Pipeline):
         )
 
         for scraped_filing in scraped_filings:
-            if keys is not None and (
-                scraped_filing.cik,
-                scraped_filing.accession_number,
-            ) not in keys:
+            if (
+                keys is not None
+                and (
+                    scraped_filing.cik,
+                    scraped_filing.accession_number,
+                )
+                not in keys
+            ):
                 continue
 
             self.stats.increment("total_filings")

@@ -31,14 +31,14 @@ _IXT_TR4_NS = "http://www.xbrl.org/inlineXBRL/transformation/2020-02-12"
 _DATE_FORMATS = ("%B %d, %Y", "%b %d, %Y", "%Y-%m-%d")
 
 _IXT_DATE_LOCAL_FORMATS: dict[str, tuple[str, ...]] = {
-    "datemonthdayyearen": ("%B %d, %Y", "%b %d, %Y"),   # TR3: "September 28, 2024"
-    "datedaymonthyearen": ("%d %B %Y", "%d %b %Y"),      # TR3: "28 September 2024"
-    "dateyearmonthday": ("%Y-%m-%d",),                    # TR3: "2024-09-28"
-    "datemonthdayyear": ("%m/%d/%Y",),                    # TR3: "09/28/2024"
+    "datemonthdayyearen": ("%B %d, %Y", "%b %d, %Y"),  # TR3: "September 28, 2024"
+    "datedaymonthyearen": ("%d %B %Y", "%d %b %Y"),  # TR3: "28 September 2024"
+    "dateyearmonthday": ("%Y-%m-%d",),  # TR3: "2024-09-28"
+    "datemonthdayyear": ("%m/%d/%Y",),  # TR3: "09/28/2024"
     "date-monthname-day-year-en": ("%B %d, %Y", "%b %d, %Y"),  # TR4
-    "date-day-monthname-year-en": ("%d %B %Y", "%d %b %Y"),    # TR4
-    "date-year-month-day": ("%Y-%m-%d",),                       # TR4
-    "date-month-day-year": ("%m/%d/%Y",),                       # TR4
+    "date-day-monthname-year-en": ("%d %B %Y", "%d %b %Y"),  # TR4
+    "date-year-month-day": ("%Y-%m-%d",),  # TR4
+    "date-month-day-year": ("%m/%d/%Y",),  # TR4
 }
 
 _logger = get_logger(__name__)
@@ -100,8 +100,8 @@ class InlineXbrlDocument:
         self._fact_cache, saw_ix = _parse_all_facts(
             root, self._prefix_map, self._contexts, self._units
         )
-        # not necessarily no inline xbrl - just none of the facts we're interested in 
-        if not saw_ix: # may be inline xbrl but no namespaces we care about?
+        # not necessarily no inline xbrl - just none of the facts we're interested in
+        if not saw_ix:  # may be inline xbrl but no namespaces we care about?
             raise NotInlineXbrlError("no ix:nonFraction or ix:nonNumeric elements found")
         # could check for dei and us-gaap namespaces
 

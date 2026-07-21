@@ -109,7 +109,9 @@ class TestExtract:
 
 
 class TestRevenue:
-    def test_revenues_preferred_over_contract_concept(self, extractor: CompanyFactsExtractor) -> None:
+    def test_revenues_preferred_over_contract_concept(
+        self, extractor: CompanyFactsExtractor
+    ) -> None:
         # Revenues is first in priority order — wins over RevenueFromContract
         facts = (
             '<p><ix:nonFraction name="us-gaap:Revenues" contextRef="c-duration" unitRef="USD" decimals="0">100</ix:nonFraction></p>'
