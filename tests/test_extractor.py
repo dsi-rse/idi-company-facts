@@ -126,7 +126,7 @@ class TestRevenue:
         )
         period_end = datetime.date(2024, 9, 28)
         revenue, _, _, _ = extractor._revenue(doc, period_end)
-        assert revenue == Decimal("100")
+        assert revenue == Decimal("200")
 
     def test_including_assessed_tax_concept_extracted(
         self, extractor: CompanyFactsExtractor
@@ -465,7 +465,9 @@ class TestExtractionFailures:
         )
         records, failures = extractor.extract(sample_filing, doc)
         assert FailureType.AMBIGUOUS_REVENUE in failures
-        assert Decimal(records[0].revenue) == Decimal("100")  # priority winner (Revenues)
+        assert Decimal(records[0].revenue) == Decimal(
+            "200"
+        )  # priority winner (Revenues excluding tax)
 
     def test_equal_revenue_values_across_concepts_not_ambiguous(
         self, extractor: CompanyFactsExtractor, sample_filing: Filing
