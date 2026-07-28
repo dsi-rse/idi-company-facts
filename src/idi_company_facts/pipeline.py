@@ -143,8 +143,8 @@ class Pipeline(ABC):
 class CompanyFactsPipeline(Pipeline):
     """Fetches annual report primary documents from S3 and extracts company facts."""
 
-    # Matches the document-level `type` field used by EDGAR for 10-K/KT and 20-F primary documents.  
-    # Note: TARGET_FORM_TYPES includes 20FR12B/20FR12G (registration statements), but EDGAR 
+    # Matches the document-level `type` field used by EDGAR for 10-K/KT and 20-F primary documents.
+    # Note: TARGET_FORM_TYPES includes 20FR12B/20FR12G (registration statements), but EDGAR
     # indexes their primary document with type="20-F".
     _PRIMARY_TYPE_RE: re.Pattern[str] = re.compile(r"^(10-?KT?|20-?F)(/A)?$", re.IGNORECASE)
     _LOG_EVERY = 100
