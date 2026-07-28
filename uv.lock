@@ -354,7 +354,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "idi-ftm2j-shared", specifier = ">=0.1.3" },
+    { name = "idi-ftm2j-shared", specifier = ">=0.1.13" },
     { name = "lxml", specifier = ">=6.1.1" },
     { name = "pandas", specifier = ">=2.2" },
     { name = "pyarrow", specifier = ">=17.0" },
@@ -370,7 +370,7 @@ dev = [
 
 [[package]]
 name = "idi-ftm2j-shared"
-version = "0.1.5"
+version = "0.1.13"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "boto3" },
@@ -379,9 +379,9 @@ dependencies = [
     { name = "tqdm" },
     { name = "watchtower" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/81/d0/1a9b228a15d73771bff627dfb5c7064352dda4be93bd45ad017025f72d5b/idi_ftm2j_shared-0.1.5.tar.gz", hash = "sha256:5508a14f07f026fe8d09cfdce05904ea04797c4bc94d18e4cad588fbef573063", size = 101316, upload-time = "2026-06-11T17:24:13.731Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/37/75/666d7c9ea3b6aa6d803dc2dbbc3a6bf911db39bd2b586a6ff91716ec3774/idi_ftm2j_shared-0.1.13.tar.gz", hash = "sha256:5b7bbb511096108a7e174ec166840b48c51e35a9d2e597c7899b4ca2ea14ffbf", size = 118569, upload-time = "2026-07-17T14:04:51.984Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/a0/03/bfb2cc49ba7b901e1af352399255edd692eb295a069d1fdea4ff2a787c3f/idi_ftm2j_shared-0.1.5-py3-none-any.whl", hash = "sha256:38f0aa097639b65950c14d6a47d1faef3ef51c0588cdde622bc22e8a3594bf93", size = 20252, upload-time = "2026-06-11T17:24:12.644Z" },
+    { url = "https://files.pythonhosted.org/packages/9e/8c/e53a5ca67b72618234fd599395fcfc660b148bb3a08f8867ff200b1cf305/idi_ftm2j_shared-0.1.13-py3-none-any.whl", hash = "sha256:3a782c41aa0c579b5bdaa43a2fe758c75adc213994918050b054741ad009a3e2", size = 21305, upload-time = "2026-07-17T14:04:50.776Z" },
 ]
 
 [[package]]

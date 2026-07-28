@@ -63,7 +63,6 @@ def make_manifest(**kwargs: object) -> ScrapedFiling:
         accession_number="0001234567-24-000001",
         form_type="10-K",
         filing_date="2024-01-15",
-        last_scraped_at="2024-01-16T00:00:00",
         index_url="https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK=1234567890",
         company_name="Test Corp",
         report_date="2023-12-31",

@@ -17,13 +17,29 @@ _XBRLDI_NS = "http://xbrl.org/2006/xbrldi"
 _DEI_URI_RE = re.compile(r"https?://xbrl\.sec\.gov/dei/")
 _USGAAP_URI_RE = re.compile(r"https?://fasb\.org/us-gaap/")
 
-# iXBRL transformation registry format values for booleans
-_IXT_BOOLEANFALSE = "ixt:booleanfalse"
-_IXT_BOOLEANTRUE = "ixt:booleantrue"
-_IXT_DATE_PREFIX = "ixt:date-"
+# iXBRL transformation registry namespace URIs
+# Booleans live in the SEC registry; dates live in TR3 (2015) or TR4 (2020).
+_IXT_SEC_NS = "http://www.sec.gov/inlineXBRL/transformation/2015-08-31"
+_IXT_TR3_NS = "http://www.xbrl.org/inlineXBRL/transformation/2015-02-26"
+_IXT_TR4_NS = "http://www.xbrl.org/inlineXBRL/transformation/2020-02-12"
 
-# Date formats commonly used in SEC iXBRL filings
+# Per-transform strptime format strings, keyed by the lowercased local name.
+# TR3 uses non-hyphenated names; TR4 uses hyphenated names.  Both registries
+# are listed here; the dispatcher resolves the namespace first, then looks up
+# the local name in this shared table.
+# Fallback strptime formats used by _parse_date_text for unknown transform names.
 _DATE_FORMATS = ("%B %d, %Y", "%b %d, %Y", "%Y-%m-%d")
+
+_IXT_DATE_LOCAL_FORMATS: dict[str, tuple[str, ...]] = {
+    "datemonthdayyearen": ("%B %d, %Y", "%b %d, %Y"),  # TR3: "September 28, 2024"
+    "datedaymonthyearen": ("%d %B %Y", "%d %b %Y"),  # TR3: "28 September 2024"
+    "dateyearmonthday": ("%Y-%m-%d",),  # TR3: "2024-09-28"
+    "datemonthdayyear": ("%m/%d/%Y",),  # TR3: "09/28/2024"
+    "date-monthname-day-year-en": ("%B %d, %Y", "%b %d, %Y"),  # TR4
+    "date-day-monthname-year-en": ("%d %B %Y", "%d %b %Y"),  # TR4
+    "date-year-month-day": ("%Y-%m-%d",),  # TR4
+    "date-month-day-year": ("%m/%d/%Y",),  # TR4
+}
 
 _logger = get_logger(__name__)
 
@@ -33,7 +49,7 @@ class XbrlParseError(Exception):
 
 
 class NotInlineXbrlError(XbrlParseError):
-    """Raised when the document is valid XML/HTML but contains no ix:* tags."""
+    """Raised when the document is valid HTML but contains no ix:* tags."""
 
 
 class InlineXbrlDocument:
@@ -55,6 +71,16 @@ class InlineXbrlDocument:
         if not html_bytes:
             raise XbrlParseError("empty document")
 
+        # Fast path: if the inline XBRL namespace URI is absent from the raw
+        # bytes, the document cannot contain ix:* elements regardless of whether
+        # it parses.  This prevents pre-inline plain-HTML filings (which often
+        # have SGML/text preambles that make the recovery parser return None)
+        # from being misclassified as MALFORMED_XBRL.
+        # Note: byte-level search assumes an ASCII compatible encoding. EDGAR only accepts
+        # documents submitted in HTML or ASCII (plain text).
+        if b"inlineXBRL" not in html_bytes:
+            raise NotInlineXbrlError("no inline XBRL namespace declared")
+
         self.used_recovery_parser = False
         try:
             root = etree.fromstring(html_bytes)
@@ -67,15 +93,19 @@ class InlineXbrlDocument:
                 raise XbrlParseError("unparseable document even in recovery mode") from None
             _logger.warning("strict XML parse failed; recovered with lenient parser")
             self.used_recovery_parser = True
-
+        # if not root.nsmap:
+        #     raise NotInlineXbrlError("No namespaces declared in the document")
         self._prefix_map = _build_prefix_map(root.nsmap)
+        # if prefix map is empty (no uri map to dei or us-gaap), then throw error
         self._contexts = _parse_contexts(root)
         self._units = _parse_units(root)
         self._fact_cache, saw_ix = _parse_all_facts(
             root, self._prefix_map, self._contexts, self._units
         )
-        if not saw_ix:
+        # not necessarily no inline xbrl - just none of the facts we're interested in
+        if not saw_ix:  # may be inline xbrl but no namespaces we care about?
             raise NotInlineXbrlError("no ix:nonFraction or ix:nonNumeric elements found")
+        # could check for dei and us-gaap namespaces
 
     def facts(self, concept: str) -> list[Fact]:
         """Return all facts for the given canonical concept name.
@@ -158,16 +188,19 @@ def _parse_contexts(root: etree._Element) -> dict[str, Context]:
     contexts: dict[str, Context] = {}
     for ctx in root.iter(f"{{{_XBRLI_NS}}}context"):
         ctx_id = ctx.get("id", "")
-        has_dims = (
-            ctx.find(f".//{{{_XBRLDI_NS}}}explicitMember") is not None
-            or ctx.find(f".//{{{_XBRLI_NS}}}typedMember") is not None
+        explicit_members = frozenset(
+            el.text.strip()
+            for el in ctx.findall(f".//{{{_XBRLDI_NS}}}explicitMember")
+            if el.text and el.text.strip()
         )
+        has_dims = bool(explicit_members) or ctx.find(f".//{{{_XBRLI_NS}}}typedMember") is not None
         contexts[ctx_id] = Context(
             context_id=ctx_id,
             instant=_parse_date_el(ctx.find(f".//{{{_XBRLI_NS}}}instant")),
             start=_parse_date_el(ctx.find(f".//{{{_XBRLI_NS}}}startDate")),
             end=_parse_date_el(ctx.find(f".//{{{_XBRLI_NS}}}endDate")),
             has_dimensions=has_dims,
+            dimension_members=explicit_members,
         )
     return contexts
 
@@ -214,16 +247,42 @@ def _parse_numeric(el: etree._Element) -> Decimal | None:
 
 
 def _parse_non_numeric(el: etree._Element) -> bool | datetime.date | str:
-    """Transform an ix:nonNumeric element's text using its format attribute."""
-    fmt = (el.get("format") or "").lower()
+    """Transform an ix:nonNumeric element's text using its format attribute.
+
+    Resolves the format prefix to its namespace URI before dispatching, so the
+    transform fires regardless of what prefix the filer chose (e.g. ``ixt``,
+    ``ixt-sec``, ``transform``).  The SEC boolean registry and the XBRL TR3/TR4
+    date registries are handled; everything else falls through to the raw text.
+    """
+    raw_fmt = el.get("format") or ""
     text = "".join(el.itertext()).strip()
 
-    if fmt == _IXT_BOOLEANFALSE:
-        return False
-    if fmt == _IXT_BOOLEANTRUE:
-        return True
-    if fmt.startswith(_IXT_DATE_PREFIX):
+    if not raw_fmt or ":" not in raw_fmt:
+        return text
+
+    prefix, local = raw_fmt.split(":", 1)
+    ns_uri = el.nsmap.get(prefix, "")
+    local_lower = local.lower()
+
+    # Boolean transforms live in the SEC transformation registry.
+    if ns_uri == _IXT_SEC_NS:
+        if local_lower == "booleanfalse":
+            return False
+        if local_lower == "booleantrue":
+            return True
+
+    # Date transforms live in TR3 (2015) or TR4 (2020).
+    if ns_uri in (_IXT_TR3_NS, _IXT_TR4_NS):
+        fmts = _IXT_DATE_LOCAL_FORMATS.get(local_lower)
+        if fmts is not None:
+            for fmt in fmts:
+                try:
+                    return datetime.datetime.strptime(text.strip(), fmt).date()
+                except ValueError:
+                    continue
+        # Unknown date local name — fall back to heuristic strptime.
         return _parse_date_text(text)
+
     return text
 
 

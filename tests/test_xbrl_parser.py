@@ -145,29 +145,53 @@ class TestNumericHandling:
 
 
 class TestNonNumericTransforms:
-    def test_booleanfalse_format(self) -> None:
+    def test_booleanfalse_sec_registry(self) -> None:
+        # Real SEC filings use ixt-sec:booleanfalse (SEC transformation registry)
         doc = InlineXbrlDocument(
             make_ixbrl_bytes(
                 contexts=_DURATION_CTX,
-                facts='<p><ix:nonNumeric name="dei:EntityShellCompany" contextRef="c-duration" format="ixt:booleanfalse">false</ix:nonNumeric></p>',
+                facts='<p><ix:nonNumeric name="dei:EntityShellCompany" contextRef="c-duration" format="ixt-sec:booleanfalse">false</ix:nonNumeric></p>',
             )
         )
         assert doc.single_fact("dei:EntityShellCompany").value is False
 
-    def test_booleantrue_format(self) -> None:
+    def test_booleantrue_sec_registry(self) -> None:
         doc = InlineXbrlDocument(
             make_ixbrl_bytes(
                 contexts=_DURATION_CTX,
-                facts='<p><ix:nonNumeric name="dei:EntityShellCompany" contextRef="c-duration" format="ixt:booleantrue">true</ix:nonNumeric></p>',
+                facts='<p><ix:nonNumeric name="dei:EntityShellCompany" contextRef="c-duration" format="ixt-sec:booleantrue">true</ix:nonNumeric></p>',
             )
         )
         assert doc.single_fact("dei:EntityShellCompany").value is True
 
-    def test_date_format_parsed(self) -> None:
+    def test_date_tr4_format_parsed(self) -> None:
+        # TR4 (2020) hyphenated date format — ixt bound to TR4 URI by default
         doc = InlineXbrlDocument(
             make_ixbrl_bytes(
                 contexts=_DURATION_CTX,
                 facts='<p><ix:nonNumeric name="dei:DocumentPeriodEndDate" contextRef="c-duration" format="ixt:date-monthname-day-year-en">September 28, 2024</ix:nonNumeric></p>',
+            )
+        )
+        assert doc.single_fact("dei:DocumentPeriodEndDate").value == datetime.date(2024, 9, 28)
+
+    def test_date_tr3_monthdayyearen_parsed(self) -> None:
+        # TR3 (2015) non-hyphenated date format — ixt bound to TR3 URI
+        doc = InlineXbrlDocument(
+            make_ixbrl_bytes(
+                contexts=_DURATION_CTX,
+                facts='<p><ix:nonNumeric name="dei:DocumentPeriodEndDate" contextRef="c-duration" format="ixt:datemonthdayyearen">September 28, 2024</ix:nonNumeric></p>',
+                ixt_ns="http://www.xbrl.org/inlineXBRL/transformation/2015-02-26",
+            )
+        )
+        assert doc.single_fact("dei:DocumentPeriodEndDate").value == datetime.date(2024, 9, 28)
+
+    def test_date_tr3_dateyearmonthday_parsed(self) -> None:
+        # TR3 ISO date format
+        doc = InlineXbrlDocument(
+            make_ixbrl_bytes(
+                contexts=_DURATION_CTX,
+                facts='<p><ix:nonNumeric name="dei:DocumentPeriodEndDate" contextRef="c-duration" format="ixt:dateyearmonthday">2024-09-28</ix:nonNumeric></p>',
+                ixt_ns="http://www.xbrl.org/inlineXBRL/transformation/2015-02-26",
             )
         )
         assert doc.single_fact("dei:DocumentPeriodEndDate").value == datetime.date(2024, 9, 28)
@@ -230,6 +254,19 @@ class TestParseErrors:
         html = b"<?xml version='1.0'?><html xmlns='http://www.w3.org/1999/xhtml'><body/></html>"
         with pytest.raises(XbrlParseError):
             InlineXbrlDocument(html)
+
+    def test_sgml_preamble_raises_not_inline_not_malformed(self) -> None:
+        # Pre-inline EDGAR filings often have a plain-text SGML header before
+        # the HTML root.  The recovery parser returns None for these, which
+        # previously produced MALFORMED_XBRL.  The byte scan must catch them
+        # first and raise NotInlineXbrlError instead.
+        sgml_doc = b"ACCESSION NUMBER: 0001234567-20-000001\n<html><body><p>Annual report</p></body></html>"
+        with pytest.raises(NotInlineXbrlError):
+            InlineXbrlDocument(sgml_doc)
+
+    def test_plain_text_doc_raises_not_inline(self) -> None:
+        with pytest.raises(NotInlineXbrlError):
+            InlineXbrlDocument(b"This is a plain text 10-K filing with no XBRL.")
 
 
 # ── TestSingleFact ────────────────────────────────────────────────────────────

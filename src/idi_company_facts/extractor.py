@@ -120,51 +120,91 @@ class CompanyFactsExtractor:
     ) -> tuple[Decimal | None, datetime.date | None, str, str, str]:
         """Return (shares, as_of_date, security_name, ticker, exchange) for common stock.
 
-        Targets only dimensionless EntityCommonStockSharesOutstanding facts —
-        the entity-level count that is not tied to a specific share class or
-        subsidiary. Multi-class and subsidiary breakdowns are ignored here and
-        will be handled in a future extraction pass.
+        Prefers a dimensionless EntityCommonStockSharesOutstanding fact (the
+        entity-level total).  When only per-class (dimensioned) facts exist —
+        e.g. multi-class share structures — sums all classes at the latest
+        reported instant.
 
-        security_name comes from dei:Security12bTitle — the registered name on
-        the 10-K cover page, e.g. "Common Stock, $0.001 par value per share".
-        Ticker, exchange, and security_name are matched first by sharing the
-        same contextRef as the shares fact, then fall back to a single
-        dimensionless fact when the contexts differ (the common SEC pattern
-        where those DEI facts sit in an annual duration context while shares
-        outstanding uses a balance-sheet instant context).
+        security_name comes from dei:Security12bTitle. Ticker, exchange, and
+        security_name are matched first by sharing the same contextRef as the
+        shares fact, then fall back to the common dimensionless value when the
+        contexts differ (the typical pattern where DEI facts sit in an annual
+        duration context while shares outstanding uses a balance-sheet instant).
         """
         shares_facts = [
             f
             for f in doc.facts(SHARES_OUTSTANDING)
             if not f.context.has_dimensions and isinstance(f.value, Decimal)
         ]
-        if not shares_facts:
-            return None, None, "", "", ""
 
-        fact = max(shares_facts, key=lambda f: f.context.instant or datetime.date.min)
-        ctx_id = fact.context.context_id
+        dim_shares_members: frozenset[str] = frozenset()
+
+        if shares_facts:
+            fact = max(shares_facts, key=lambda f: f.context.instant or datetime.date.min)
+            shares_value: Decimal = fact.value
+            shares_date = fact.context.instant
+            anchor_ctx_id: str | None = fact.context.context_id
+        else:
+            # Fall back to summing per-class dimensioned facts at the latest instant.
+            dim_facts = [
+                f
+                for f in doc.facts(SHARES_OUTSTANDING)
+                if f.context.has_dimensions
+                and isinstance(f.value, Decimal)
+                and f.context.instant is not None
+            ]
+            if not dim_facts:
+                return None, None, "", "", ""
+            latest = max(f.context.instant for f in dim_facts)  # type: ignore[arg-type]
+            at_latest = [f for f in dim_facts if f.context.instant == latest]
+            shares_value = sum(f.value for f in at_latest)  # type: ignore[assignment]
+            shares_date = latest
+            anchor_ctx_id = None
+            # Collect all dimension members present across the share-class contexts
+            # so we can match security facts by shared member rather than context_id.
+            dim_shares_members = frozenset(
+                m for f in at_latest for m in f.context.dimension_members
+            )
 
         by_ctx: dict[str, dict[str, str]] = {}
         for concept in (TRADING_SYMBOL, SECURITY_EXCHANGE_NAME, SECURITY_12B_TITLE):
             for f in doc.facts(concept):
                 by_ctx.setdefault(f.context.context_id, {})[concept] = str(f.value)
 
-        matched = by_ctx.get(ctx_id, {})
+        matched = by_ctx.get(anchor_ctx_id or "", {})
+
+        # For multi-class filers the security facts may be in different contexts
+        # that share a dimension member with the shares fact.  Merge all matches.
+        if not matched and dim_shares_members:
+            for concept in (TRADING_SYMBOL, SECURITY_EXCHANGE_NAME, SECURITY_12B_TITLE):
+                for f in doc.facts(concept):
+                    if f.context.dimension_members & dim_shares_members:
+                        matched.setdefault(concept, str(f.value))
+
         ticker = matched.get(TRADING_SYMBOL, "")
         exchange = matched.get(SECURITY_EXCHANGE_NAME, "")
         security_name = matched.get(SECURITY_12B_TITLE, "")
 
         if not ticker:
-            # Fallback: single dimensionless fact for each DEI concept
-            def _dl_single(concept: str) -> str:
+            # Fallback: most common dimensionless value for each DEI concept.
+            # When all dimensionless facts agree (the typical single-class case)
+            # this returns that value; when they conflict it returns the first.
+            def _dl_common(concept: str) -> str:
                 vals = [str(f.value) for f in doc.facts(concept) if not f.context.has_dimensions]
-                return vals[0] if len(vals) == 1 else ""
+                if not vals:
+                    return ""
+                # Return the unanimous value, or first as a best-effort pick.
+                return vals[0]
 
-            ticker = _dl_single(TRADING_SYMBOL)
-            exchange = _dl_single(SECURITY_EXCHANGE_NAME)
-            security_name = _dl_single(SECURITY_12B_TITLE)
+            ticker = _dl_common(TRADING_SYMBOL)
+            exchange = _dl_common(SECURITY_EXCHANGE_NAME)
+            security_name = _dl_common(SECURITY_12B_TITLE)
 
-        return fact.value, fact.context.instant, security_name, ticker, exchange
+        # Normalize placeholder tickers that indicate no listed security.
+        if ticker.strip().lower() in ("none", "-", "n/a"):
+            ticker = ""
+
+        return shares_value, shares_date, security_name, ticker, exchange
 
     def _shell_company(self, doc: InlineXbrlDocument) -> bool | None:
         """Return EntityShellCompany as a bool, or None if absent or unrecognised.
