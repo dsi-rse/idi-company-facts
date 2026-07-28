@@ -7,7 +7,6 @@ PUBLIC_FLOAT = "dei:EntityPublicFloat"
 SHARES_OUTSTANDING = "dei:EntityCommonStockSharesOutstanding"
 SHELL_COMPANY = "dei:EntityShellCompany"
 TRADING_SYMBOL = "dei:TradingSymbol"
-NO_TRADING_SYMBOL_FLAG = "dei:NoTradingSymbolFlag"
 SECURITY_EXCHANGE_NAME = "dei:SecurityExchangeName"
 SECURITY_12B_TITLE = "dei:Security12bTitle"
 

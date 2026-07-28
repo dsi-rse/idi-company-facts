@@ -6,7 +6,6 @@ from decimal import Decimal
 from idi_company_facts.failures import FailureType
 from idi_company_facts.types import CompanyFactsRecord, Filing
 from idi_company_facts.xbrl.concepts import (
-    NO_TRADING_SYMBOL_FLAG,
     PERIOD_END,
     PUBLIC_FLOAT,
     REGISTRANT_NAME,
@@ -195,7 +194,7 @@ class CompanyFactsExtractor:
                 if not vals:
                     return ""
                 # Return the unanimous value, or first as a best-effort pick.
-                return vals[0] if len(set(vals)) == 1 else vals[0]
+                return vals[0]
 
             ticker = _dl_common(TRADING_SYMBOL)
             exchange = _dl_common(SECURITY_EXCHANGE_NAME)
@@ -204,12 +203,6 @@ class CompanyFactsExtractor:
         # Normalize placeholder tickers that indicate no listed security.
         if ticker.strip().lower() in ("none", "-", "n/a"):
             ticker = ""
-
-        # Treat NoTradingSymbolFlag=true as a valid no-ticker filing, not a miss.
-        if not ticker:
-            no_symbol = doc.single_fact(NO_TRADING_SYMBOL_FLAG)
-            if no_symbol is not None and no_symbol.value is True:
-                pass  # valid empty — leave ticker as ""
 
         return shares_value, shares_date, security_name, ticker, exchange
 

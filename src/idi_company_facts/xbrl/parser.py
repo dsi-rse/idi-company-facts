@@ -76,6 +76,8 @@ class InlineXbrlDocument:
         # it parses.  This prevents pre-inline plain-HTML filings (which often
         # have SGML/text preambles that make the recovery parser return None)
         # from being misclassified as MALFORMED_XBRL.
+        # Note: byte-level search assumes an ASCII compatible encoding. EDGAR only accepts
+        # documents submitted in HTML or ASCII (plain text).
         if b"inlineXBRL" not in html_bytes:
             raise NotInlineXbrlError("no inline XBRL namespace declared")
 
