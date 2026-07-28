@@ -16,6 +16,7 @@ _XBRLDI_NS = "http://xbrl.org/2006/xbrldi"
 
 _DEI_URI_RE = re.compile(r"https?://xbrl\.sec\.gov/dei/")
 _USGAAP_URI_RE = re.compile(r"https?://fasb\.org/us-gaap/")
+_IFRSFULL_URI_RE = re.compile(r"https?://xbrl\.ifrs\.org/.+/ifrs-full$")
 
 # iXBRL transformation registry namespace URIs
 # Booleans live in the SEC registry; dates live in TR3 (2015) or TR4 (2020).
@@ -23,23 +24,8 @@ _IXT_SEC_NS = "http://www.sec.gov/inlineXBRL/transformation/2015-08-31"
 _IXT_TR3_NS = "http://www.xbrl.org/inlineXBRL/transformation/2015-02-26"
 _IXT_TR4_NS = "http://www.xbrl.org/inlineXBRL/transformation/2020-02-12"
 
-# Per-transform strptime format strings, keyed by the lowercased local name.
-# TR3 uses non-hyphenated names; TR4 uses hyphenated names.  Both registries
-# are listed here; the dispatcher resolves the namespace first, then looks up
-# the local name in this shared table.
-# Fallback strptime formats used by _parse_date_text for unknown transform names.
-_DATE_FORMATS = ("%B %d, %Y", "%b %d, %Y", "%Y-%m-%d")
-
-_IXT_DATE_LOCAL_FORMATS: dict[str, tuple[str, ...]] = {
-    "datemonthdayyearen": ("%B %d, %Y", "%b %d, %Y"),  # TR3: "September 28, 2024"
-    "datedaymonthyearen": ("%d %B %Y", "%d %b %Y"),  # TR3: "28 September 2024"
-    "dateyearmonthday": ("%Y-%m-%d",),  # TR3: "2024-09-28"
-    "datemonthdayyear": ("%m/%d/%Y",),  # TR3: "09/28/2024"
-    "date-monthname-day-year-en": ("%B %d, %Y", "%b %d, %Y"),  # TR4
-    "date-day-monthname-year-en": ("%d %B %Y", "%d %b %Y"),  # TR4
-    "date-year-month-day": ("%Y-%m-%d",),  # TR4
-    "date-month-day-year": ("%m/%d/%Y",),  # TR4
-}
+# Date formats commonly used in SEC iXBRL filings
+_DATE_FORMATS = ("%B %d, %Y", "%b %d, %Y", "%Y-%m-%d", "%B %d %Y", "%b %d %Y")
 
 _logger = get_logger(__name__)
 
@@ -151,6 +137,8 @@ def _build_prefix_map(nsmap: dict) -> dict[str, str]:
             result[prefix] = "dei"
         elif _USGAAP_URI_RE.match(uri):
             result[prefix] = "us-gaap"
+        elif _IFRSFULL_URI_RE.match(uri):
+            result[prefix] = "ifrs-full"
     return result
 
 
