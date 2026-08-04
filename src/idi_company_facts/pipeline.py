@@ -372,6 +372,24 @@ class CompanyFactsPipeline(Pipeline):
                     self.stats.increment("no_revenue_concept")
                 elif failure_type == FailureType.AMBIGUOUS_REVENUE:
                     self.stats.increment("ambiguous_revenue")
+            for record in records:
+                # Multiple registered securities is expected (ADS + ordinary
+                # shares, dual-class, listed notes) — log it for visibility
+                # rather than recording a failure.
+                if len(record.registered_securities) > 1:
+                    self.stats.increment("multiple_registered_securities")
+                    self.logger.info(
+                        "%s registered %d securities: %s (common stock: %s)",
+                        filing.accession_number,
+                        len(record.registered_securities),
+                        ", ".join(
+                            f"{s.ticker or s.security_name or '<untitled>'}[{s.security_type}]"
+                            for s in record.registered_securities
+                        ),
+                        record.registered_securities[0].ticker
+                        or record.registered_securities[0].security_name
+                        or "<none>",
+                    )
             self.stats.increment("extracted_documents", len(records))
             return records
         except NotInlineXbrlError:
@@ -401,7 +419,19 @@ class CompanyFactsPipeline(Pipeline):
             self.logger.info("no records extracted; skipping output write")
             return
         df = pd.DataFrame([asdict(r) for r in processed_list])
-        df = df.drop_duplicates(subset=["company_cik", "accession_number", "ticker"])
+        # Flatten the securities list into parallel pipe-delimited columns —
+        # entry i of each column describes the same security, common stock first.
+        # Empty slots are preserved so the columns stay index-aligned.
+        securities = df.pop("registered_securities")
+        df["all_security_names"] = securities.map(
+            lambda secs: " | ".join(s["security_name"] for s in secs)
+        )
+        df["all_tickers"] = securities.map(lambda secs: " | ".join(s["ticker"] for s in secs))
+        df["all_exchanges"] = securities.map(lambda secs: " | ".join(s["exchange"] for s in secs))
+        df["all_security_types"] = securities.map(
+            lambda secs: " | ".join(s["security_type"] for s in secs)
+        )
+        df = df.drop_duplicates(subset=["company_cik", "accession_number"])
         df.to_parquet(self.config.output_file, index=False)
         self.logger.info("Saved %d records to %s", len(df), self.config.output_file)
 
@@ -426,4 +456,5 @@ class CompanyFactsPipeline(Pipeline):
         self.logger.info("    Missing period end: %d", self.stats.missing_period_end)
         self.logger.info("    No revenue concept: %d", self.stats.no_revenue_concept)
         self.logger.info("    Ambiguous revenue:  %d", self.stats.ambiguous_revenue)
+        self.logger.info("    Multiple securities:%d", self.stats.multiple_registered_securities)
         self.logger.info("=" * 40)

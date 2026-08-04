@@ -2,12 +2,24 @@
 
 import datetime
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date
 from decimal import Decimal
+from enum import StrEnum
 
 # Single source of truth for which filings carry a primary document
 TARGET_FORM_TYPES = ["10-K", "10-K/A", "10-KT", "10-KT/A"]
+
+
+class SecurityType(StrEnum):
+    """high-level classification of a registered security."""
+
+    COMMON = "common"
+    ADS = "ads"
+    PREFERRED = "preferred"
+    DEBT = "debt"
+    WARRANT = "warrant"
+    OTHER = "other"
 
 
 @dataclass(frozen=True)
@@ -80,6 +92,7 @@ class PipelineStats:
     missing_period_end: int = 0
     no_revenue_concept: int = 0
     ambiguous_revenue: int = 0
+    multiple_registered_securities: int = 0
     recovered_parse: int = 0
 
     def __post_init__(self) -> None:
@@ -97,6 +110,22 @@ class PipelineStats:
             setattr(self, field_name, getattr(self, field_name) + n)
 
 
+@dataclass(frozen=True, slots=True)
+class RegisteredSecurity:
+    """One security registered under Section 12(b), from the 10K/20F cover page.
+
+    Fields map to the DEI concepts dei:Security12bTitle, dei:TradingSymbol,
+    and dei:SecurityExchangeName respectively. Any field may be empty — e.g.
+    registered debt securities often carry a title and exchange but no
+    conventional trading symbol.
+    """
+
+    security_name: str = ""
+    ticker: str = ""
+    exchange: str = ""
+    security_type: SecurityType = SecurityType.OTHER
+
+
 @dataclass
 class CompanyFactsRecord:
     """Company facts extracted from a 10-K inline XBRL document."""
@@ -109,9 +138,9 @@ class CompanyFactsRecord:
     filing_date: date | None = None
     report_date: date | None = None  # Fiscal year end of the report
     company_name: str = ""
-    security_name: str = ""
-    ticker: str = ""
-    exchange: str = ""
+    # All registered securities found on the cover page, ranked so the
+    # common-stock class (anchored to EntityCommonStockSharesOutstanding) is first.
+    registered_securities: list[RegisteredSecurity] = field(default_factory=list)
     market_value: str = ""
     market_value_as_of_date: date | None = None
     market_value_currency: str = ""
