@@ -266,6 +266,17 @@ class TestLoadInput:
         assert pipeline.stats.failed_primary_docs == 1
         assert pipeline.stats.total_primary_docs == 1
 
+    def test_queries_filings_by_scraped_date(
+        self, pipeline: CompanyFactsPipeline, mocker: MockerFixture
+    ) -> None:
+        """load_input passes search_by='scraped_date' to iter_filings_by_form_type."""
+        mock_iter = mocker.patch(
+            "idi_company_facts.pipeline.iter_filings_by_form_type",
+            return_value=iter([]),
+        )
+        pipeline.load_input()
+        assert mock_iter.call_args.kwargs["search_by"] == "scraped_date"
+
 
 # ---------------------------------------------------------------------------
 # run() — failure flushing and lifecycle

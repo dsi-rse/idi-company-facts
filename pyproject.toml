@@ -9,7 +9,7 @@ description = "Retrieves company facts information from the SEC scraper"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
-  "idi-ftm2j-shared>=0.1.13",
+  "idi-ftm2j-shared>=0.1.16",
   "lxml>=6.1.1",
   "pandas>=2.2",
   "pyarrow>=17.0",

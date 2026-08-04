@@ -6,15 +6,19 @@ The orchestrator is responsible for running the pipeline.
 # Standard imports
 import argparse
 import datetime
+import io
 
 # Third party imports
+import pandas as pd
 from idi_ftm2j_shared.logs import get_logger
+from idi_ftm2j_shared.storage import load_content
 
 # Application imports
 from idi_company_facts.pipeline import CompanyFactsPipeline
 from idi_company_facts.types import PipelineConfig
 
 DEFAULT_LOOK_BACK: int = 7
+_SEC_MANIFEST_KEY = "sec/manifest.parquet"
 
 
 def valid_date(s: str) -> datetime.date:
@@ -59,27 +63,42 @@ def validate_args(args: argparse.Namespace, parser: argparse.ArgumentParser) -> 
         args.look_back = DEFAULT_LOOK_BACK
 
 
-def get_dates(
-    args: argparse.Namespace, today: datetime.date | None = None
-) -> tuple[datetime.date, datetime.date]:
-    """Resolve start/end dates from parsed CLI args.
+def _get_latest_scraped_date(bucket: str) -> datetime.date:
+    """Return the most recent date_scraped from the SEC manifest parquet.
 
-    In daily mode: end = today, start = end - look_back days.
+    Args:
+        bucket: S3 bucket name containing the SEC scraper data.
+
+    Returns:
+        The latest ``date_scraped`` value as a :class:`datetime.date`.
+
+    Raises:
+        ValueError: If the manifest has no usable ``date_scraped`` values.
+    """
+    raw = load_content(f"s3://{bucket}/{_SEC_MANIFEST_KEY}")
+    df = pd.read_parquet(io.BytesIO(raw))
+    latest = df["date_scraped"].max()
+    if pd.isna(latest):
+        raise ValueError("manifest.parquet has no usable date_scraped values")
+    return pd.to_datetime(latest).date()
+
+
+def get_dates(args: argparse.Namespace) -> tuple[datetime.date, datetime.date]:
+    """Resolve start/end dates from parsed arguments.
+
+    In daily mode: end = latest date_scraped from the SEC bucket's manifest.parquet,
+    start = end - look_back days.
     In explicit mode: pass through the parsed --start-date and --end-date.
 
     Args:
         args: Parsed command-line arguments.
-        today: if daily mode, the end date to parse.
-            Use look back to determine start date.
 
     Returns:
         Tuple of ``(start_date, end_date)``.
-
-
     """
     if not args.daily:
         return args.start_date, args.end_date
-    end = today if today is not None else datetime.date.today()
+    end = _get_latest_scraped_date(args.sec_bucket)
     start = end - datetime.timedelta(days=args.look_back)
     return start, end
 
