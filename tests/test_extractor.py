@@ -9,7 +9,7 @@ from idi_company_facts.extractor import CompanyFactsExtractor
 from idi_company_facts.failures import FailureType
 from idi_company_facts.types import Filing
 from idi_company_facts.xbrl.parser import InlineXbrlDocument
-from tests.conftest import load_fixture, make_ixbrl_bytes
+from tests.conftest import load_fixture, make_ifrs_ixbrl_bytes, make_ixbrl_bytes
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -109,10 +109,10 @@ class TestExtract:
 
 
 class TestRevenue:
-    def test_revenues_preferred_over_contract_concept(
+    def test_contract_concept_preferred_over_revenues(
         self, extractor: CompanyFactsExtractor
     ) -> None:
-        # Revenues is first in priority order — wins over RevenueFromContract
+        # RevenueFromContractWithCustomerExcludingAssessedTax has higher priority than Revenues
         facts = (
             '<p><ix:nonFraction name="us-gaap:Revenues" contextRef="c-duration" unitRef="USD" decimals="0">100</ix:nonFraction></p>'
             '<p><ix:nonFraction name="us-gaap:RevenueFromContractWithCustomerExcludingAssessedTax" contextRef="c-duration" unitRef="USD" decimals="0">200</ix:nonFraction></p>'
@@ -126,7 +126,7 @@ class TestRevenue:
         )
         period_end = datetime.date(2024, 9, 28)
         revenue, _, _, _ = extractor._revenue(doc, period_end)
-        assert revenue == Decimal("100")
+        assert revenue == Decimal("200")
 
     def test_including_assessed_tax_concept_extracted(
         self, extractor: CompanyFactsExtractor
@@ -465,7 +465,9 @@ class TestExtractionFailures:
         )
         records, failures = extractor.extract(sample_filing, doc)
         assert FailureType.AMBIGUOUS_REVENUE in failures
-        assert Decimal(records[0].revenue) == Decimal("100")  # priority winner (Revenues)
+        assert Decimal(records[0].revenue) == Decimal(
+            "200"
+        )  # priority winner (Revenues excluding tax)
 
     def test_equal_revenue_values_across_concepts_not_ambiguous(
         self, extractor: CompanyFactsExtractor, sample_filing: Filing
@@ -481,3 +483,185 @@ class TestExtractionFailures:
         )
         _, failures = extractor.extract(sample_filing, doc)
         assert FailureType.AMBIGUOUS_REVENUE not in failures
+
+
+# ── TestExtract20F ────────────────────────────────────────────────────────────
+
+_20F_INSTANT_CTX = """
+<xbrli:context id="c-instant">
+  <xbrli:entity><xbrli:identifier scheme="http://www.sec.gov/CIK">0009876543</xbrli:identifier></xbrli:entity>
+  <xbrli:period><xbrli:instant>2024-12-31</xbrli:instant></xbrli:period>
+</xbrli:context>
+"""
+_20F_DURATION_CTX = """
+<xbrli:context id="c-duration">
+  <xbrli:entity><xbrli:identifier scheme="http://www.sec.gov/CIK">0009876543</xbrli:identifier></xbrli:entity>
+  <xbrli:period>
+    <xbrli:startDate>2024-01-01</xbrli:startDate>
+    <xbrli:endDate>2024-12-31</xbrli:endDate>
+  </xbrli:period>
+</xbrli:context>
+"""
+_EUR_UNIT = '<xbrli:unit id="EUR"><xbrli:measure>iso4217:EUR</xbrli:measure></xbrli:unit>'
+
+
+@pytest.fixture
+def filing_20f() -> Filing:
+    return Filing(
+        cik="0009876543",
+        accession_number="0009876543-25-000001",
+        form_type="20-F",
+        filing_date=datetime.date(2025, 4, 1),
+        primary_s3_key="s3://bucket/form20f.htm",
+        primary_url="https://www.sec.gov/Archives/edgar/data/9876543/000987654325000001/form20f.htm",
+        company_name="ACME INTERNATIONAL PLC",
+    )
+
+
+class TestExtract20F:
+    """Extraction from IFRS-based 20-F filings."""
+
+    def test_extracts_ifrs_revenue_broad(
+        self, extractor: CompanyFactsExtractor, filing_20f: Filing
+    ) -> None:
+        # ifrs-full:Revenue (broad IFRS total) — reported in millions, scale=6
+        facts = (
+            '<ix:nonNumeric name="dei:DocumentPeriodEndDate" contextRef="c-duration"'
+            ' format="ixt:date-monthname-day-year-en">December 31, 2024</ix:nonNumeric>'
+            '<ix:nonNumeric name="dei:EntityRegistrantName" contextRef="c-duration">ACME INTERNATIONAL PLC</ix:nonNumeric>'
+            '<ix:nonFraction name="ifrs-full:Revenue" contextRef="c-duration"'
+            ' unitRef="EUR" decimals="-6" scale="6">2500</ix:nonFraction>'
+        )
+        doc = InlineXbrlDocument(
+            make_ifrs_ixbrl_bytes(
+                contexts=_20F_DURATION_CTX,
+                units=_EUR_UNIT,
+                facts=facts,
+            )
+        )
+        records, failures = extractor.extract(filing_20f, doc)
+        assert len(records) == 1
+        assert records[0].revenue == "2500000000"
+        assert records[0].revenue_currency == "EUR"
+        assert records[0].report_date == datetime.date(2024, 12, 31)
+        assert records[0].form_type == "20-F"
+        assert FailureType.NO_REVENUE_CONCEPT not in failures
+
+    def test_extracts_ifrs15_revenue_concept(
+        self, extractor: CompanyFactsExtractor, filing_20f: Filing
+    ) -> None:
+        # ifrs-full:RevenueFromContractsWithCustomers has higher priority than ifrs-full:Revenue
+        facts = (
+            '<ix:nonNumeric name="dei:DocumentPeriodEndDate" contextRef="c-duration"'
+            ' format="ixt:date-monthname-day-year-en">December 31, 2024</ix:nonNumeric>'
+            '<ix:nonFraction name="ifrs-full:RevenueFromContractsWithCustomers" contextRef="c-duration"'
+            ' unitRef="EUR" decimals="0">3000000000</ix:nonFraction>'
+            '<ix:nonFraction name="ifrs-full:Revenue" contextRef="c-duration"'
+            ' unitRef="EUR" decimals="0">3100000000</ix:nonFraction>'
+        )
+        doc = InlineXbrlDocument(
+            make_ifrs_ixbrl_bytes(
+                contexts=_20F_DURATION_CTX,
+                units=_EUR_UNIT,
+                facts=facts,
+            )
+        )
+        records, failures = extractor.extract(filing_20f, doc)
+        assert len(records) == 1
+        # RevenueFromContractsWithCustomers wins (higher priority in REVENUE_CONCEPTS)
+        assert Decimal(records[0].revenue) == Decimal("3000000000")
+        assert FailureType.AMBIGUOUS_REVENUE in failures  # values differ
+
+    def test_non_standard_ifrs_prefix_normalized(
+        self, extractor: CompanyFactsExtractor, filing_20f: Filing
+    ) -> None:
+        # Some filers declare the IFRS namespace with a prefix like "ifrs" instead of "ifrs-full".
+        # _build_prefix_map should remap it to "ifrs-full" so REVENUE_CONCEPTS still match.
+        facts = (
+            '<ix:nonNumeric name="dei:DocumentPeriodEndDate" contextRef="c-duration"'
+            ' format="ixt:date-monthname-day-year-en">December 31, 2024</ix:nonNumeric>'
+            '<ix:nonFraction name="ifrs:Revenue" contextRef="c-duration"'
+            ' unitRef="EUR" decimals="0">1800000000</ix:nonFraction>'
+        )
+        doc = InlineXbrlDocument(
+            make_ifrs_ixbrl_bytes(
+                contexts=_20F_DURATION_CTX,
+                units=_EUR_UNIT,
+                facts=facts,
+                ifrs_prefix="ifrs",
+            )
+        )
+        records, failures = extractor.extract(filing_20f, doc)
+        assert len(records) == 1
+        assert records[0].revenue == "1800000000"
+        assert FailureType.NO_REVENUE_CONCEPT not in failures
+
+    def test_period_end_text_date_no_format_attribute(
+        self, extractor: CompanyFactsExtractor, filing_20f: Filing
+    ) -> None:
+        # Some 20-F filers omit format= on dei:DocumentPeriodEndDate; the parser
+        # returns the raw text string. _period_end must still parse it via parse_date_text.
+        facts = (
+            '<ix:nonNumeric name="dei:DocumentPeriodEndDate" contextRef="c-duration">'
+            "December 31, 2024"
+            "</ix:nonNumeric>"
+            '<ix:nonFraction name="ifrs-full:Revenue" contextRef="c-duration"'
+            ' unitRef="EUR" decimals="0">500000000</ix:nonFraction>'
+        )
+        doc = InlineXbrlDocument(
+            make_ifrs_ixbrl_bytes(
+                contexts=_20F_DURATION_CTX,
+                units=_EUR_UNIT,
+                facts=facts,
+            )
+        )
+        records, failures = extractor.extract(filing_20f, doc)
+        assert records[0].report_date == datetime.date(2024, 12, 31)
+        assert records[0].revenue == "500000000"
+        assert FailureType.MISSING_PERIOD_END not in failures
+        assert FailureType.NO_REVENUE_CONCEPT not in failures
+
+    def test_period_end_text_date_no_comma(
+        self, extractor: CompanyFactsExtractor, filing_20f: Filing
+    ) -> None:
+        # "December 31 2021" (no comma) — some filers omit the comma in addition to format=.
+        facts = (
+            '<ix:nonNumeric name="dei:DocumentPeriodEndDate" contextRef="c-duration">'
+            "December 31 2024"
+            "</ix:nonNumeric>"
+            '<ix:nonFraction name="ifrs-full:Revenue" contextRef="c-duration"'
+            ' unitRef="EUR" decimals="0">300000000</ix:nonFraction>'
+        )
+        doc = InlineXbrlDocument(
+            make_ifrs_ixbrl_bytes(
+                contexts=_20F_DURATION_CTX,
+                units=_EUR_UNIT,
+                facts=facts,
+            )
+        )
+        records, failures = extractor.extract(filing_20f, doc)
+        assert records[0].report_date == datetime.date(2024, 12, 31)
+        assert records[0].revenue == "300000000"
+        assert FailureType.MISSING_PERIOD_END not in failures
+
+    def test_revenue_including_assessed_tax(
+        self, extractor: CompanyFactsExtractor, filing_20f: Filing
+    ) -> None:
+        # us-gaap:RevenueFromContractWithCustomerIncludingAssessedTax is now in REVENUE_CONCEPTS.
+        facts = (
+            '<ix:nonNumeric name="dei:DocumentPeriodEndDate" contextRef="c-duration"'
+            ' format="ixt:date-monthname-day-year-en">December 31, 2024</ix:nonNumeric>'
+            '<ix:nonFraction name="us-gaap:RevenueFromContractWithCustomerIncludingAssessedTax"'
+            ' contextRef="c-duration" unitRef="USD" decimals="0">74569867</ix:nonFraction>'
+        )
+        doc = InlineXbrlDocument(
+            make_ifrs_ixbrl_bytes(
+                contexts=_20F_DURATION_CTX,
+                units='<xbrli:unit id="USD"><xbrli:measure>iso4217:USD</xbrli:measure></xbrli:unit>',
+                facts=facts,
+            )
+        )
+        records, failures = extractor.extract(filing_20f, doc)
+        assert records[0].revenue == "74569867"
+        assert records[0].revenue_currency == "USD"
+        assert FailureType.NO_REVENUE_CONCEPT not in failures

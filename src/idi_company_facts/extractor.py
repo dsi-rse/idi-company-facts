@@ -16,7 +16,7 @@ from idi_company_facts.xbrl.concepts import (
     SHELL_COMPANY,
     TRADING_SYMBOL,
 )
-from idi_company_facts.xbrl.parser import InlineXbrlDocument
+from idi_company_facts.xbrl.parser import InlineXbrlDocument, parse_date_text
 
 _ANNUAL_MIN_DAYS = 340
 _ANNUAL_MAX_DAYS = 380
@@ -28,7 +28,7 @@ def _fmt(value: Decimal) -> str:
 
 
 class CompanyFactsExtractor:
-    """Extract structured company facts from a 10-K iXBRL document."""
+    """Extract structured company facts from an annual-report iXBRL document."""
 
     def __init__(self) -> None:
         """Initialize the extractor."""
@@ -43,7 +43,7 @@ class CompanyFactsExtractor:
 
         Args:
             filing: Metadata from the SEC scraper (CIK, dates, URLs).
-            doc: Parsed iXBRL document for the filing's primary 10-K exhibit.
+            doc: Parsed iXBRL document for the filing's primary annual exhibit.
 
         Returns:
             A tuple of (records, failures) where records is a single-element list
@@ -95,9 +95,22 @@ class CompanyFactsExtractor:
         return [record], failures
 
     def _period_end(self, doc: InlineXbrlDocument) -> datetime.date | None:
-        """Return DocumentPeriodEndDate as a date, or None if absent or non-date."""
+        """Return DocumentPeriodEndDate as a date, or None if absent or unparseable.
+
+        Some filers omit the format= attribute on dei:DocumentPeriodEndDate, so
+        the parser returns the raw text string instead of a datetime.date.  Try
+        parse_date_text as a fallback so those filings still anchor correctly.
+        """
         fact = doc.single_fact(PERIOD_END)
-        return fact.value if fact is not None and isinstance(fact.value, datetime.date) else None
+        if fact is None:
+            return None
+        if isinstance(fact.value, datetime.date):
+            return fact.value
+        if isinstance(fact.value, str):
+            parsed = parse_date_text(fact.value)
+            if isinstance(parsed, datetime.date):
+                return parsed
+        return None
 
     def _registrant_name(self, doc: InlineXbrlDocument) -> str:
         """Return EntityRegistrantName text, normalised to a single line."""
@@ -125,11 +138,13 @@ class CompanyFactsExtractor:
         e.g. multi-class share structures — sums all classes at the latest
         reported instant.
 
-        security_name comes from dei:Security12bTitle. Ticker, exchange, and
-        security_name are matched first by sharing the same contextRef as the
-        shares fact, then fall back to the common dimensionless value when the
-        contexts differ (the typical pattern where DEI facts sit in an annual
-        duration context while shares outstanding uses a balance-sheet instant).
+        security_name comes from dei:Security12bTitle — the registered name on
+        the filing cover page, e.g. "Common Stock, $0.001 par value per share".
+        Ticker, exchange, and security_name are matched first by sharing the
+        same contextRef as the shares fact, then fall back to a single
+        dimensionless fact when the contexts differ (the common SEC pattern
+        where those DEI facts sit in an annual duration context while shares
+        outstanding uses a balance-sheet instant context).
         """
         shares_facts = [
             f

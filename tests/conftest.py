@@ -18,6 +18,45 @@ def load_fixture(name: str) -> bytes:
     return (_FIXTURES_DIR / name).read_bytes()
 
 
+def make_ifrs_ixbrl_bytes(
+    *,
+    contexts: str = "",
+    units: str = "",
+    facts: str = "",
+    dei_prefix: str = "dei",
+    ifrs_prefix: str = "ifrs-full",
+) -> bytes:
+    """Build minimal iXBRL XHTML bytes for a 20-F (IFRS) filing.
+
+    Args:
+        contexts: XML string of xbrli:context elements to inject.
+        units: XML string of xbrli:unit elements to inject.
+        facts: XML string of ix:nonFraction/ix:nonNumeric elements to inject.
+        dei_prefix: Namespace prefix for the DEI taxonomy (default ``dei``).
+        ifrs_prefix: Namespace prefix for the IFRS taxonomy (default ``ifrs-full``).
+
+    Returns:
+        Bytes of a well-formed iXBRL XHTML document.
+    """
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+<html
+  xmlns="http://www.w3.org/1999/xhtml"
+  xmlns:ix="http://www.xbrl.org/2013/inlineXBRL"
+  xmlns:xbrli="http://www.xbrl.org/2003/instance"
+  xmlns:xbrldi="http://xbrl.org/2006/xbrldi"
+  xmlns:{dei_prefix}="http://xbrl.sec.gov/dei/2024"
+  xmlns:{ifrs_prefix}="http://xbrl.ifrs.org/taxonomy/2023-03-23/ifrs-full">
+<head><title>Test 20-F iXBRL</title></head>
+<body>
+<ix:header><ix:resources>
+{contexts}
+{units}
+</ix:resources></ix:header>
+{facts}
+</body>
+</html>""".encode()
+
+
 def make_ixbrl_bytes(
     *,
     contexts: str = "",

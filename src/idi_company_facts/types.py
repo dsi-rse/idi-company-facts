@@ -7,7 +7,20 @@ from datetime import date
 from decimal import Decimal
 
 # Single source of truth for which filings carry a primary document
-TARGET_FORM_TYPES = ["10-K", "10-K/A", "10-KT", "10-KT/A"]
+TARGET_FORM_TYPES = [
+    # Domestic filer
+    "10-K",
+    "10-K/A",
+    "10-KT",
+    "10-KT/A",
+    # Foreign filer
+    "20-F",
+    "20-F/A",
+    "20FR12B",
+    "20FR12B/A",
+    "20FR12G",
+    "20FR12G/A",
+]
 
 
 @dataclass(frozen=True)
