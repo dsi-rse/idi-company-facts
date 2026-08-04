@@ -109,10 +109,10 @@ class TestExtract:
 
 
 class TestRevenue:
-    def test_revenues_preferred_over_contract_concept(
+    def test_contract_concept_preferred_over_revenues(
         self, extractor: CompanyFactsExtractor
     ) -> None:
-        # Revenues is first in priority order — wins over RevenueFromContract
+        # RevenueFromContractWithCustomerExcludingAssessedTax has higher priority than Revenues
         facts = (
             '<p><ix:nonFraction name="us-gaap:Revenues" contextRef="c-duration" unitRef="USD" decimals="0">100</ix:nonFraction></p>'
             '<p><ix:nonFraction name="us-gaap:RevenueFromContractWithCustomerExcludingAssessedTax" contextRef="c-duration" unitRef="USD" decimals="0">200</ix:nonFraction></p>'
@@ -600,7 +600,7 @@ class TestExtract20F:
         self, extractor: CompanyFactsExtractor, filing_20f: Filing
     ) -> None:
         # Some 20-F filers omit format= on dei:DocumentPeriodEndDate; the parser
-        # returns the raw text string. _period_end must still parse it via _parse_date_text.
+        # returns the raw text string. _period_end must still parse it via parse_date_text.
         facts = (
             '<ix:nonNumeric name="dei:DocumentPeriodEndDate" contextRef="c-duration">'
             "December 31, 2024"

@@ -164,7 +164,7 @@ def _normalize_concept(name: str, prefix_map: dict[str, str]) -> str:
     return f"{prefix_map.get(prefix, prefix)}:{local}"
 
 
-def _parse_date_text(text: str) -> datetime.date | str:
+def parse_date_text(text: str) -> datetime.date | str:
     """Parse common SEC date text formats; return original string on failure."""
     cleaned = text.strip()
     for fmt in _DATE_FORMATS:
@@ -283,7 +283,7 @@ def _parse_non_numeric(el: etree._Element) -> bool | datetime.date | str:
                 except ValueError:
                     continue
         # Unknown date local name — fall back to heuristic strptime.
-        return _parse_date_text(text)
+        return parse_date_text(text)
 
     return text
 

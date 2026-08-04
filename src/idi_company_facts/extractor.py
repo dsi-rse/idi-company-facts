@@ -16,7 +16,7 @@ from idi_company_facts.xbrl.concepts import (
     SHELL_COMPANY,
     TRADING_SYMBOL,
 )
-from idi_company_facts.xbrl.parser import InlineXbrlDocument, _parse_date_text
+from idi_company_facts.xbrl.parser import InlineXbrlDocument, parse_date_text
 
 _ANNUAL_MIN_DAYS = 340
 _ANNUAL_MAX_DAYS = 380
@@ -99,7 +99,7 @@ class CompanyFactsExtractor:
 
         Some filers omit the format= attribute on dei:DocumentPeriodEndDate, so
         the parser returns the raw text string instead of a datetime.date.  Try
-        _parse_date_text as a fallback so those filings still anchor correctly.
+        parse_date_text as a fallback so those filings still anchor correctly.
         """
         fact = doc.single_fact(PERIOD_END)
         if fact is None:
@@ -107,7 +107,7 @@ class CompanyFactsExtractor:
         if isinstance(fact.value, datetime.date):
             return fact.value
         if isinstance(fact.value, str):
-            parsed = _parse_date_text(fact.value)
+            parsed = parse_date_text(fact.value)
             if isinstance(parsed, datetime.date):
                 return parsed
         return None
