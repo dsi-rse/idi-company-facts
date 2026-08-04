@@ -210,7 +210,7 @@ class CompanyFactsPipeline(Pipeline):
             start_date=start_date,
             end_date=end_date,
             bucket=self.config.sec_bucket,
-            include_failures=True,
+            search_by="scraped_date",
         )
 
         for scraped_filing in scraped_filings:
