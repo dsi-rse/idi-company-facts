@@ -1,0 +1,31 @@
+# PR quality gate. Thin caller of the shared composition pipeline-checks.yml
+# (lint, test, security, pulumi preview), pinned to an exact release of
+# dsi-rse/idi-ftm2j-shared. Bump the @vX.Y.Z pin to upgrade.
+name: Checks
+
+on:
+  pull_request:
+    branches:
+      - main
+      - dev
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  id-token: write          # OIDC for the pulumi preview role
+  security-events: write   # CodeQL upload
+
+jobs:
+  checks:
+    uses: dsi-rse/idi-ftm2j-shared/.github/workflows/pipeline-checks.yml@v0.1.19
+    secrets: inherit
+    with:
+      app-name: company-facts
+      cov-package: idi_company_facts
