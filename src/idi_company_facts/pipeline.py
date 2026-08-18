@@ -374,8 +374,7 @@ class CompanyFactsPipeline(Pipeline):
                     self.stats.increment("ambiguous_revenue")
             for record in records:
                 # Multiple registered securities is expected (ADS + ordinary
-                # shares, dual-class, listed notes) — log it for visibility
-                # rather than recording a failure.
+                # shares, dual-class, listed notes)
                 if len(record.registered_securities) > 1:
                     self.stats.increment("multiple_registered_securities")
                     self.logger.info(
@@ -456,5 +455,5 @@ class CompanyFactsPipeline(Pipeline):
         self.logger.info("    Missing period end: %d", self.stats.missing_period_end)
         self.logger.info("    No revenue concept: %d", self.stats.no_revenue_concept)
         self.logger.info("    Ambiguous revenue:  %d", self.stats.ambiguous_revenue)
-        self.logger.info("    Multiple securities:%d", self.stats.multiple_registered_securities)
+        self.logger.info("    Multiple securities: %d", self.stats.multiple_registered_securities)
         self.logger.info("=" * 40)

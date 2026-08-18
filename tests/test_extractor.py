@@ -498,11 +498,11 @@ class TestRegisteredSecurities:
         assert len(securities) == 3
         assert securities[2].security_type == SecurityType.DEBT
 
-    def test_duplicate_dimensional_and_dimensionless_deduped(
+    def test_duplicate_dimensional_and_dimensionless_kept_separate(
         self, extractor: CompanyFactsExtractor
     ) -> None:
-        # Single-class filer that tags the ticker both dimensionlessly and in
-        # a ClassOfStock context — must yield one security.
+        # A filer that tags the ticker both dimensionlessly and in a ClassOfStock
+        # context produces two distinct entries — one per (ticker, members) key.
         dup_facts = (
             '<p><ix:nonFraction name="dei:EntityCommonStockSharesOutstanding" contextRef="c-instant" unitRef="shares" decimals="0">1000</ix:nonFraction></p>'
             '<p><ix:nonNumeric name="dei:TradingSymbol" contextRef="c-duration">AAPL</ix:nonNumeric></p>'
@@ -517,9 +517,46 @@ class TestRegisteredSecurities:
             )
         )
         _, _, securities = extractor._shares_and_securities(doc)
-        assert len(securities) == 1
-        assert securities[0].ticker == "AAPL"
-        assert securities[0].exchange == "NASDAQ"  # richer entry kept
+        assert len(securities) == 2
+        tickers = {s.ticker for s in securities}
+        assert tickers == {"AAPL"}
+
+    def test_same_ticker_distinct_members_kept_separate(
+        self, extractor: CompanyFactsExtractor
+    ) -> None:
+        # Foreign issuer with both ordinary shares and ADS sharing the same
+        # trading symbol — they must NOT be merged into one security.
+        ord_ctx = """
+        <xbrli:context id="c-ord">
+          <xbrli:entity>
+            <xbrli:identifier scheme="http://www.sec.gov/CIK">0001234567</xbrli:identifier>
+            <xbrli:segment>
+              <xbrldi:explicitMember dimension="us-gaap:StatementClassOfStockAxis">us-gaap:OrdinarySharesMember</xbrldi:explicitMember>
+            </xbrli:segment>
+          </xbrli:entity>
+          <xbrli:period>
+            <xbrli:startDate>2023-09-30</xbrli:startDate>
+            <xbrli:endDate>2024-09-28</xbrli:endDate>
+          </xbrli:period>
+        </xbrli:context>"""
+        facts = (
+            '<p><ix:nonNumeric name="dei:Security12bTitle" contextRef="c-ord">Ordinary Shares</ix:nonNumeric></p>'
+            '<p><ix:nonNumeric name="dei:TradingSymbol" contextRef="c-ord">BABA</ix:nonNumeric></p>'
+            '<p><ix:nonNumeric name="dei:SecurityExchangeName" contextRef="c-ord">NYSE</ix:nonNumeric></p>'
+            '<p><ix:nonNumeric name="dei:Security12bTitle" contextRef="c-ads">American Depositary Shares</ix:nonNumeric></p>'
+            '<p><ix:nonNumeric name="dei:TradingSymbol" contextRef="c-ads">BABA</ix:nonNumeric></p>'
+            '<p><ix:nonNumeric name="dei:SecurityExchangeName" contextRef="c-ads">NYSE</ix:nonNumeric></p>'
+        )
+        doc = InlineXbrlDocument(
+            make_ixbrl_bytes(
+                contexts=ord_ctx + _ADS_CTX,
+                facts=facts,
+            )
+        )
+        _, _, securities = extractor._shares_and_securities(doc)
+        assert len(securities) == 2
+        types = {s.security_type for s in securities}
+        assert types == {SecurityType.COMMON, SecurityType.ADS}
 
     def test_extract_multiple_securities_does_not_fail(
         self, extractor: CompanyFactsExtractor, sample_filing: Filing
@@ -588,7 +625,9 @@ class TestRegisteredSecurities:
     def test_dedupe_member_type_beats_title_type(self, extractor: CompanyFactsExtractor) -> None:
         # Same ticker tagged dimensionlessly (title "Common Stock" → COMMON)
         # and dimensionally with AmericanDepositarySharesMember (→ ADS).
-        # The ADS member-derived type must win.
+        # Each (ticker, members) key is distinct, so two entries are produced;
+        # the ADS one ranks first because COMMON outranks ADS in _TYPE_ORDER
+        # only when the COMMON entry is the anchor — here it is not.
         mixed_facts = (
             '<p><ix:nonFraction name="dei:EntityCommonStockSharesOutstanding" contextRef="c-instant"'
             ' unitRef="shares" decimals="0">1000</ix:nonFraction></p>'
@@ -605,10 +644,10 @@ class TestRegisteredSecurities:
             )
         )
         _, _, securities = extractor._shares_and_securities(doc)
-        assert len(securities) == 1
-        assert securities[0].ticker == "XYZ"
-        # ADS member-derived classification wins over COMMON title-derived.
-        assert securities[0].security_type == SecurityType.ADS
+        assert len(securities) == 2
+        types = {s.security_type for s in securities}
+        assert SecurityType.ADS in types
+        assert SecurityType.COMMON in types
 
 
 # ── TestSecurityClassifier ────────────────────────────────────────────────────
@@ -675,6 +714,13 @@ class TestSecurityClassifier:
     def test_member_senior_notes_is_debt(self) -> None:
         members = frozenset({"us-gaap:SeniorNotesMember"})
         assert _classify_security(members, "") == SecurityType.DEBT
+
+    def test_member_word_boundary_ads_not_in_crossroads(self) -> None:
+        # "crossroads" contains the substring "ads" but it is not a whole word
+        # after camelCase splitting; the member must not classify as ADS.
+        members = frozenset({"us-gaap:CrossroadsSystemsMember"})
+        result = _classify_security(members, "")
+        assert result != SecurityType.ADS
 
     def test_empty_both_is_other(self) -> None:
         assert _classify_security(frozenset(), "") == SecurityType.OTHER

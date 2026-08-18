@@ -47,16 +47,22 @@ _TYPE_ORDER: dict[SecurityType, int] = {
     SecurityType.OTHER: 5,
 }
 
-# Patterns applied to the squished (lowercase, space-stripped) blob of local
-# dimension-member names.  Evaluated in order; first match wins.
+# Splits a camelCase/PascalCase local name into lowercase words so that word-
+# boundary patterns in _MEMBER_PATTERNS cannot fire on accidental substrings.
+# Example: "CrossroadsSystemsMember" → "crossroads systems member" (so \bads\b
+# does not match the "ads" hidden inside "crossroads").
+_CAMEL = re.compile(r"[A-Z]+(?![a-z])|[A-Z][a-z]*|[a-z]+|\d+")
+
+# Patterns applied to the space-joined, lowercase word blob of local dimension-
+# member names.  Evaluated in order; first match wins.
 # COMMON last to catch special cases before the common stock that may be wrappers or in combination
 # with common stocks/shares
 _MEMBER_PATTERNS: tuple[tuple[SecurityType, re.Pattern[str]], ...] = (
-    (SecurityType.ADS, re.compile(r"americandepositary|depositaryreceipt|ads|adr")),
-    (SecurityType.PREFERRED, re.compile(r"preferred|preference")),
-    (SecurityType.WARRANT, re.compile(r"warrant")),
-    (SecurityType.DEBT, re.compile(r"note(?!worthy)|debenture|bond")),
-    (SecurityType.COMMON, re.compile(r"commonclass|commonstock|commonshare|ordinaryshare")),
+    (SecurityType.ADS, re.compile(r"american\s+depositary|\bdepositary\s+receipt|\bads\b|\badr\b")),
+    (SecurityType.PREFERRED, re.compile(r"\bpreferred\b|\bpreference\b")),
+    (SecurityType.WARRANT, re.compile(r"\bwarrant\b")),
+    (SecurityType.DEBT, re.compile(r"\bnotes?\b|\bdebenture\b|\bbond\b")),
+    (SecurityType.COMMON, re.compile(r"\bcommon\b|\bordinary\b")),
 )
 
 # Patterns applied to the lowercased, whitespace-normalised Security12bTitle.
@@ -104,8 +110,9 @@ def _classify_security(members: frozenset[str], title: str) -> SecurityType:
         The best-matching SecurityType, or OTHER when nothing matches.
     """
     if members:
-        # Squish all local names into one lowercase string for substring search.
-        blob = "".join(m.split(":")[-1].lower() for m in sorted(members))
+        blob = " ".join(
+            t.lower() for m in sorted(members) for t in _CAMEL.findall(m.split(":")[-1])
+        )
         for sec_type, pattern in _MEMBER_PATTERNS:
             if pattern.search(blob):
                 return sec_type
@@ -346,7 +353,8 @@ class CompanyFactsExtractor:
         # another, all describing the same security.
         if dimless_groups:
             conflicting = any(
-                len({slot[c] for slot in dimless_groups.values() if c in slot}) > 1
+                len({" ".join(slot[c].split()) for slot in dimless_groups.values() if c in slot})
+                > 1
                 for c in _SECURITY_CONCEPTS
             )
             if not conflicting:
@@ -398,38 +406,41 @@ class CompanyFactsExtractor:
     ) -> list[tuple[frozenset[str], frozenset[str], RegisteredSecurity]]:
         """Collapse entries describing the same security.
 
-        Securities with a ticker are keyed by ticker; ticker-less securities
-        (e.g. registered notes) are keyed by (title, exchange). When duplicates
-        collide, the entry with more populated fields wins and the context ids
-        / dimension members of both are merged so anchor matching still works.
+        Entries are keyed by (ticker, members) for ticker-bearing securities,
+        or (name, exchange) for ticker-less ones. Two entries with the same
+        ticker but different dimension members (e.g. ordinary shares and ADS
+        both trading as "BABA") are never conflated. Dimensionless entries
+        (members = frozenset()) only merge with other dimensionless entries for
+        the same ticker.
+
+        When duplicates collide, each field takes the first non-empty value.
         The security_type is reconciled: member-derived beats title-derived,
         non-OTHER beats OTHER.
         """
-        by_key: dict[
-            tuple[str, str], tuple[frozenset[str], frozenset[str], RegisteredSecurity]
-        ] = {}
+        by_key: dict[tuple, tuple[frozenset[str], frozenset[str], RegisteredSecurity]] = {}
         for ctx_ids, members, sec in entries:
-            key = (
-                ("ticker", sec.ticker.lower())
-                if sec.ticker
-                else (sec.security_name.lower(), sec.exchange.lower())
-            )
+            if sec.ticker:
+                key: tuple = ("ticker", sec.ticker.lower(), members)
+            else:
+                key = (sec.security_name.lower(), sec.exchange.lower())
             existing = by_key.get(key)
             if existing is None:
                 by_key[key] = (ctx_ids, members, sec)
                 continue
             ex_ctx, ex_members, ex_sec = existing
-            richer = max(
-                (ex_sec, sec),
-                key=lambda s: sum(bool(v) for v in (s.security_name, s.ticker, s.exchange)),
-            )
             resolved_type = _reconcile_types(
                 ex_sec.security_type,
                 bool(ex_members),
                 sec.security_type,
                 bool(members),
             )
-            merged_sec = dataclasses.replace(richer, security_type=resolved_type)
+            merged_sec = dataclasses.replace(
+                ex_sec,
+                security_name=ex_sec.security_name or sec.security_name,
+                ticker=ex_sec.ticker or sec.ticker,
+                exchange=ex_sec.exchange or sec.exchange,
+                security_type=resolved_type,
+            )
             by_key[key] = (ex_ctx | ctx_ids, ex_members | members, merged_sec)
         return list(by_key.values())
 
