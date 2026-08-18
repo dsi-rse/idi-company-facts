@@ -3,12 +3,19 @@
 import datetime
 from datetime import date
 
+import pandas as pd
 import pytest
 from idi_ftm2j_shared.types import ScrapedDocument, ScrapedFiling
 from pytest_mock import MockerFixture
 
 from idi_company_facts.pipeline import CompanyFactsPipeline
-from idi_company_facts.types import Filing, PipelineConfig
+from idi_company_facts.types import (
+    CompanyFactsRecord,
+    Filing,
+    PipelineConfig,
+    RegisteredSecurity,
+    SecurityType,
+)
 from tests.conftest import make_ixbrl_bytes
 
 # ── Shared iXBRL building blocks for process() tests ──────────────────────────
@@ -488,3 +495,138 @@ class TestProcess:
 
         progress_calls = [c for c in mock_logger.info.call_args_list if "progress:" in str(c)]
         assert progress_calls, "expected at least one progress log line"
+
+
+# ---------------------------------------------------------------------------
+# save_output — parquet column structure
+# ---------------------------------------------------------------------------
+
+
+def _make_record_with_securities(
+    securities: list[RegisteredSecurity],
+) -> CompanyFactsRecord:
+    return CompanyFactsRecord(
+        company_cik="0001234567",
+        accession_number="0001234567-24-000001",
+        form_type="10-K",
+        doc_type="10-K",
+        primary_url="https://sec.gov/test.htm",
+        registered_securities=securities,
+    )
+
+
+class TestSaveOutput:
+    """Tests for CompanyFactsPipeline.save_output() column structure."""
+
+    def test_single_security_flattened_correctly(
+        self, pipeline: CompanyFactsPipeline, tmp_path: pytest.TempPathFactory
+    ) -> None:
+        """A record with one security produces pipe-delimited columns with a single entry."""
+        pipeline.config.output_file = str(tmp_path / "out.parquet")
+        sec = RegisteredSecurity(
+            security_name="Common Stock",
+            ticker="AAPL",
+            exchange="NASDAQ",
+            security_type=SecurityType.COMMON,
+        )
+        record = _make_record_with_securities([sec])
+
+        pipeline.save_output([record])
+
+        df = pd.read_parquet(pipeline.config.output_file)
+        assert df["all_tickers"].iloc[0] == "AAPL"
+        assert df["all_security_names"].iloc[0] == "Common Stock"
+        assert df["all_exchanges"].iloc[0] == "NASDAQ"
+        assert df["all_security_types"].iloc[0] == "common"
+
+    def test_multiple_securities_pipe_delimited(
+        self, pipeline: CompanyFactsPipeline, tmp_path: pytest.TempPathFactory
+    ) -> None:
+        """Multiple securities produce pipe-delimited values, common stock first."""
+        pipeline.config.output_file = str(tmp_path / "out.parquet")
+        common = RegisteredSecurity(
+            security_name="Ordinary Shares",
+            ticker="ORD",
+            exchange="Euronext Paris",
+            security_type=SecurityType.COMMON,
+        )
+        ads = RegisteredSecurity(
+            security_name="American Depositary Shares",
+            ticker="ADSX",
+            exchange="NYSE",
+            security_type=SecurityType.ADS,
+        )
+        record = _make_record_with_securities([common, ads])
+
+        pipeline.save_output([record])
+
+        df = pd.read_parquet(pipeline.config.output_file)
+        assert df["all_tickers"].iloc[0] == "ORD | ADSX"
+        assert df["all_security_names"].iloc[0] == "Ordinary Shares | American Depositary Shares"
+        assert df["all_exchanges"].iloc[0] == "Euronext Paris | NYSE"
+        assert df["all_security_types"].iloc[0] == "common | ads"
+
+    def test_registered_securities_column_absent(
+        self, pipeline: CompanyFactsPipeline, tmp_path: pytest.TempPathFactory
+    ) -> None:
+        """The raw registered_securities list column is not written to the parquet output."""
+        pipeline.config.output_file = str(tmp_path / "out.parquet")
+        record = _make_record_with_securities(
+            [
+                RegisteredSecurity(
+                    ticker="AAPL", exchange="NASDAQ", security_type=SecurityType.COMMON
+                )
+            ]
+        )
+
+        pipeline.save_output([record])
+
+        df = pd.read_parquet(pipeline.config.output_file)
+        assert "registered_securities" not in df.columns
+
+    def test_three_security_types_pipe_delimited(
+        self, pipeline: CompanyFactsPipeline, tmp_path: pytest.TempPathFactory
+    ) -> None:
+        """Three-security fixture produces 'common | ads | debt' in all_security_types."""
+        pipeline.config.output_file = str(tmp_path / "out.parquet")
+        secs = [
+            RegisteredSecurity(ticker="ORD", security_type=SecurityType.COMMON),
+            RegisteredSecurity(ticker="ADSX", security_type=SecurityType.ADS),
+            RegisteredSecurity(ticker="ORD27", security_type=SecurityType.DEBT),
+        ]
+        record = _make_record_with_securities(secs)
+
+        pipeline.save_output([record])
+
+        df = pd.read_parquet(pipeline.config.output_file)
+        assert df["all_security_types"].iloc[0] == "common | ads | debt"
+
+    def test_multiple_securities_increments_stat(
+        self, pipeline: CompanyFactsPipeline, mocker: MockerFixture
+    ) -> None:
+        """_process_one increments multiple_registered_securities when > 1 security."""
+        two_secs = [
+            RegisteredSecurity(
+                ticker="ORD", exchange="Euronext Paris", security_type=SecurityType.COMMON
+            ),
+            RegisteredSecurity(ticker="ADSX", exchange="NYSE", security_type=SecurityType.ADS),
+        ]
+        record = _make_record_with_securities(two_secs)
+        mocker.patch.object(pipeline.extractor, "extract", return_value=([record], []))
+        mocker.patch("idi_company_facts.pipeline.load_content", return_value=b"dummy")
+        mocker.patch(
+            "idi_company_facts.pipeline.InlineXbrlDocument", return_value=mocker.MagicMock()
+        )
+
+        pipeline._process_one(
+            Filing(
+                cik="0001234567",
+                accession_number="0001234567-24-000001",
+                form_type="10-K",
+                filing_date=date(2024, 1, 15),
+                primary_s3_key="s3://bucket/test.htm",
+                primary_url="https://sec.gov/test.htm",
+            )
+        )
+
+        assert pipeline.stats.multiple_registered_securities == 1
