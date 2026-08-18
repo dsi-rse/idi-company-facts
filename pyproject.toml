@@ -74,3 +74,8 @@ dev = [
     "pytest-mock>=3.14",
     "ruff>=0.8.0",
 ]
+pulumi = [
+    "pulumi>=3.220.0",
+    "pulumi-aws>=7.19.0",
+    "pyyaml>=6.0",
+    "pip>=24.0"]
