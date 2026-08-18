@@ -141,10 +141,12 @@ class Pipeline(ABC):
 
 
 class CompanyFactsPipeline(Pipeline):
-    """Fetches 10-K primary documents from S3 and extracts company facts."""
+    """Fetches annual report primary documents from S3 and extracts company facts."""
 
-    # Matches 10-K, 10K, 10-K/A, 10K/A, 10-KT, 10KT, 10-KT/A, 10KT/A — case-insensitive.
-    _PRIMARY_TYPE_RE: re.Pattern[str] = re.compile(r"^10-?KT?(/A)?$", re.IGNORECASE)
+    # Matches the document-level `type` field used by EDGAR for 10-K/KT and 20-F primary documents.
+    # Note: TARGET_FORM_TYPES includes 20FR12B/20FR12G (registration statements), but EDGAR
+    # indexes their primary document with type="20-F".
+    _PRIMARY_TYPE_RE: re.Pattern[str] = re.compile(r"^(10-?KT?|20-?F)(/A)?$", re.IGNORECASE)
     _LOG_EVERY = 100
 
     def __init__(self, config: PipelineConfig) -> None:
@@ -210,7 +212,7 @@ class CompanyFactsPipeline(Pipeline):
             start_date=start_date,
             end_date=end_date,
             bucket=self.config.sec_bucket,
-            include_failures=True,
+            search_by="scraped_date",
         )
 
         for scraped_filing in scraped_filings:

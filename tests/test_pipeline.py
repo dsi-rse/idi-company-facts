@@ -133,8 +133,20 @@ class TestSelectPrimaryDocument:
         manifest = make_manifest(documents=[make_doc(doc_type="10-KT/A", seq="1")])
         assert pipeline._select_primary_document(manifest) is not None
 
+    def test_picks_standard_20f(self, pipeline: CompanyFactsPipeline) -> None:
+        """Selects a document whose type is exactly '20-F'."""
+        manifest = make_manifest(documents=[make_doc(doc_type="20-F", seq="1")])
+        result = pipeline._select_primary_document(manifest)
+        assert result is not None
+        assert result.type == "20-F"
+
+    def test_handles_20f_a(self, pipeline: CompanyFactsPipeline) -> None:
+        """'20-F/A' (amendment) is matched by the regex."""
+        manifest = make_manifest(documents=[make_doc(doc_type="20-F/A", seq="1")])
+        assert pipeline._select_primary_document(manifest) is not None
+
     def test_returns_none_when_no_primary_doc(self, pipeline: CompanyFactsPipeline) -> None:
-        """Non-10-K document types (exhibits, graphics, XML) return None."""
+        """Non-primary document types (exhibits, graphics, XML) return None."""
         manifest = make_manifest(
             documents=[
                 make_doc(doc_type="EX-21.1", seq="1"),
@@ -260,6 +272,17 @@ class TestLoadInput:
         assert pipeline.stats.failed_filings == 1
         assert pipeline.stats.failed_primary_docs == 1
         assert pipeline.stats.total_primary_docs == 1
+
+    def test_queries_filings_by_scraped_date(
+        self, pipeline: CompanyFactsPipeline, mocker: MockerFixture
+    ) -> None:
+        """load_input passes search_by='scraped_date' to iter_filings_by_form_type."""
+        mock_iter = mocker.patch(
+            "idi_company_facts.pipeline.iter_filings_by_form_type",
+            return_value=iter([]),
+        )
+        pipeline.load_input()
+        assert mock_iter.call_args.kwargs["search_by"] == "scraped_date"
 
 
 # ---------------------------------------------------------------------------

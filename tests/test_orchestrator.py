@@ -5,6 +5,7 @@ import sys
 from datetime import date, timedelta
 
 import pytest
+from pytest_mock import MockerFixture
 
 from idi_company_facts.orchestrator import (
     DEFAULT_LOOK_BACK,
@@ -34,6 +35,7 @@ def make_args(**kwargs: object) -> argparse.Namespace:
         start_date=None,
         end_date=None,
         look_back=None,
+        sec_bucket="test-bucket",
     )
     defaults.update(kwargs)
     return argparse.Namespace(**defaults)
@@ -87,6 +89,10 @@ class TestValidateArgs:
         validate_args(args, self._parser())  # must not raise
 
 
+_LATEST_SCRAPED = date(2024, 6, 15)
+_MOCK_TARGET = "idi_company_facts.orchestrator._get_latest_scraped_date"
+
+
 class TestGetDates:
     """Tests for get_dates() date-window resolution."""
 
@@ -97,33 +103,43 @@ class TestGetDates:
         assert start == date(2024, 1, 1)
         assert end == date(2024, 1, 31)
 
-    def test_daily_end_equals_today(self) -> None:
-        """In daily mode, end is the value passed as today."""
-        today = date(2024, 6, 15)
+    def test_daily_end_equals_latest_scraped_date(self, mocker: MockerFixture) -> None:
+        """In daily mode, end is the latest date_scraped from the manifest."""
+        mocker.patch(_MOCK_TARGET, return_value=_LATEST_SCRAPED)
         args = make_args(daily=True, look_back=DEFAULT_LOOK_BACK)
-        _, end = get_dates(args, today=today)
-        assert end == today
+        _, end = get_dates(args)
+        assert end == _LATEST_SCRAPED
 
-    def test_daily_start_is_end_minus_look_back(self) -> None:
+    def test_daily_start_is_end_minus_look_back(self, mocker: MockerFixture) -> None:
         """In daily mode, start is exactly look_back days before end."""
-        today = date(2024, 6, 15)
+        mocker.patch(_MOCK_TARGET, return_value=_LATEST_SCRAPED)
         args = make_args(daily=True, look_back=7)
-        start, end = get_dates(args, today=today)
+        start, end = get_dates(args)
         assert start == end - timedelta(days=7)
 
-    def test_daily_custom_look_back(self) -> None:
+    def test_daily_custom_look_back(self, mocker: MockerFixture) -> None:
         """look_back controls the window width in daily mode."""
-        today = date(2024, 6, 15)
+        mocker.patch(_MOCK_TARGET, return_value=_LATEST_SCRAPED)
         args = make_args(daily=True, look_back=30)
-        start, end = get_dates(args, today=today)
+        start, end = get_dates(args)
         assert (end - start).days == 30
 
-    def test_daily_default_look_back_is_seven(self) -> None:
+    def test_daily_default_look_back_is_seven(self, mocker: MockerFixture) -> None:
         """DEFAULT_LOOK_BACK is 7 and produces a 7-day window."""
-        today = date(2024, 6, 15)
+        mocker.patch(_MOCK_TARGET, return_value=_LATEST_SCRAPED)
         args = make_args(daily=True, look_back=DEFAULT_LOOK_BACK)
-        start, end = get_dates(args, today=today)
+        start, end = get_dates(args)
         assert (end - start).days == DEFAULT_LOOK_BACK
+
+    def test_daily_raises_when_no_scraped_dates(self, mocker: MockerFixture) -> None:
+        """ValueError from the manifest propagates out of get_dates."""
+        mocker.patch(
+            _MOCK_TARGET,
+            side_effect=ValueError("manifest.parquet has no usable date_scraped values"),
+        )
+        args = make_args(daily=True, look_back=DEFAULT_LOOK_BACK)
+        with pytest.raises(ValueError, match="date_scraped"):
+            get_dates(args)
 
 
 class TestValidDate:

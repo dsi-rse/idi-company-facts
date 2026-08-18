@@ -11,13 +11,12 @@ SECURITY_EXCHANGE_NAME = "dei:SecurityExchangeName"
 SECURITY_12B_TITLE = "dei:Security12bTitle"
 
 # Revenue concepts in priority order — first annual match wins.
-# Revenues (broadest total) is preferred so that companies reporting both a
-# line-item ASC 606 concept AND the total don't get flagged as ambiguous.
-# The Including/Excluding assessed-tax pair is placed adjacent so that filers
-# tagging only one of them are handled correctly.
+# Most-specific/most-recent standard first; IFRS equivalents follow each US-GAAP concept.
 REVENUE_CONCEPTS: tuple[str, ...] = (
-    "us-gaap:Revenues",  # broad total — preferred
-    "us-gaap:RevenueFromContractWithCustomerExcludingAssessedTax",  # ASC 606 excl. tax
-    "us-gaap:RevenueFromContractWithCustomerIncludingAssessedTax",  # ASC 606 incl. tax
+    "us-gaap:RevenueFromContractWithCustomerExcludingAssessedTax",  # ASC 606  without tax (2018+)
+    "us-gaap:RevenueFromContractWithCustomerIncludingAssessedTax",  # ASC 606 with tax
+    "ifrs-full:RevenueFromContractsWithCustomers",  # IFRS 15 (2018+)
     "us-gaap:SalesRevenueNet",  # deprecated 2018
+    "us-gaap:Revenues",  # broad total
+    "ifrs-full:Revenue",  # broad IFRS total
 )
