@@ -1,0 +1,31 @@
+# Post-merge pipeline. Thin caller of the shared composition pipeline-docker.yml
+# (version -> docker -> sync-ecr -> deploy-pulumi, plus sync-dev), pinned to an
+# exact release of dsi-rse/idi-ftm2j-shared. Bump the @vX.Y.Z pin to upgrade.
+name: Deploy
+
+on:
+  push:
+    branches:
+      - main
+      - dev
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write   # version bump commit, tag + release, sync-dev
+  id-token: write   # OIDC: AWS (pulumi deploy + ECR)
+  packages: write   # push images to GHCR
+
+jobs:
+  pipeline:
+    uses: dsi-rse/idi-ftm2j-shared/.github/workflows/pipeline-docker.yml@v0.1.19
+    secrets: inherit
+    with:
+      app-name: company-facts
+      images: '[{"name":"orchestrator","dockerfile":"dockerfiles/Dockerfile.orchestrator"}]'

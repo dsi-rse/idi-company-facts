@@ -1,0 +1,50 @@
+name: idi
+runtime: python
+description: AWS ECS infrastructure for IDI Company Facts Pipeline
+
+config:
+  aws:region:
+    description: AWS region to deploy to
+    value: us-east-2
+
+  idi:app_name:
+    description: Name of the application
+    default: "company-facts"
+
+  idi:sec_user_agent:
+    description: "SEC EDGAR User-Agent header — public contact string (Name email@example.com)"
+
+  idi:cron_company_facts:
+    description: EventBridge cron schedule for the company facts processor
+    default: "cron(0 5 * * ? *)"
+
+  idi:cpu:
+    description: Fargate task CPU units (256, 512, 1024, 2048, 4096)
+    default: "1024"
+
+  idi:memory:
+    description: Fargate task memory in MiB (must be valid for chosen CPU)
+    default: "4096"
+
+  idi:num_workers:
+    description: Number of parallel document-fetch worker threads
+    default: "10"
+
+  idi:schedule_enabled:
+    description: Whether the EventBridge schedule is enabled
+    default: "false"
+
+  idi:database_prefix:
+    description: >-
+      Key prefix within the shared bucket where published datasets live. The
+      processor writes its Parquet output to
+      {bucket}/{database_prefix}/{app_name}/latest.parquet.
+    default: "database"
+
+  idi:log_retention_days:
+    description: CloudWatch log group retention in days
+    default: "30"
+
+  idi:ecr_image_count:
+    description: ECR image retention count
+    default: "5"
