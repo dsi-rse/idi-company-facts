@@ -7,7 +7,6 @@ The orchestrator is responsible for running the pipeline.
 import argparse
 import datetime
 import io
-from pathlib import Path
 
 # Third party imports
 import pandas as pd
@@ -146,8 +145,8 @@ def get_args() -> argparse.Namespace:
         "--ciks-override",
         metavar="PATH",
         help=(
-            "File of CIKs (one per line, '#' comments allowed); process each "
-            "CIK's most recent scraped target filing instead of a date window"
+            "Local or s3:// file of CIKs (one per line, '#' comments allowed); "
+            "process each CIK's most recent scraped target filing instead of a date window"
         ),
     )
 
@@ -192,17 +191,21 @@ def load_ciks_file(path: str) -> tuple[str, ...]:
     manifest's representation.
 
     Args:
-        path: Path to the CIK list file.
+        path: Local or s3:// path to the CIK list file.
 
     Returns:
         Normalized CIKs in first-seen order.
 
     Raises:
-        ValueError: If a line is not a decimal integer or the file has no CIKs.
+        ValueError: If the file is missing/empty, a line is not a decimal
+            integer, or the file has no CIKs.
     """
+    raw = load_content(path)
+    if not raw:
+        raise ValueError(f"CIK file not found or empty: {path}")
     ciks: list[str] = []
     seen: set[str] = set()
-    for line in Path(path).read_text().splitlines():
+    for line in raw.decode().splitlines():
         entry = line.split("#", 1)[0].strip()
         if not entry:
             continue
