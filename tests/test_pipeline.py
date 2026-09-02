@@ -275,6 +275,27 @@ class TestLoadInput:
         assert pipeline.stats.failed_primary_docs == 1
         assert pipeline.stats.total_primary_docs == 1
 
+    def test_skips_filings_already_in_output(
+        self, pipeline: CompanyFactsPipeline, mocker: MockerFixture
+    ) -> None:
+        """A scanned filing whose (cik, accession) is already in the output is skipped."""
+        done = make_manifest(cik="111", accession_number="0000000111-24-000001")
+        fresh = make_manifest(cik="222", accession_number="0000000222-24-000001")
+        pd.DataFrame(
+            # zero-padded on purpose: the resume check must normalize CIKs
+            {"company_cik": ["0000000111"], "accession_number": ["0000000111-24-000001"]}
+        ).to_parquet(pipeline.config.output_file, index=False)
+        mocker.patch(
+            "idi_company_facts.pipeline.iter_filings_by_form_type",
+            return_value=iter([done, fresh]),
+        )
+
+        filings = pipeline.load_input()
+
+        assert [f.accession_number for f in filings] == ["0000000222-24-000001"]
+        assert pipeline.stats.skipped_filings == 1
+        assert pipeline.stats.total_filings == 2
+
     def test_queries_filings_by_scraped_date(
         self, pipeline: CompanyFactsPipeline, mocker: MockerFixture
     ) -> None:
@@ -787,17 +808,16 @@ class TestSaveOutput:
         df = pd.read_parquet(pipeline.config.output_file)
         assert df["all_security_types"].iloc[0] == "common | ads | debt"
 
-    def test_override_mode_merges_with_existing_output(
+    def test_merges_with_existing_output(
         self, pipeline: CompanyFactsPipeline, tmp_path: pytest.TempPathFactory
     ) -> None:
-        """In --ciks-override mode existing rows are kept and new rows win collisions."""
+        """Existing rows are kept and this run's rows win key collisions."""
         pipeline.config.output_file = str(tmp_path / "out.parquet")
         kept = _make_record_with_securities([RegisteredSecurity(ticker="OLD")])
         kept.accession_number = "0001234567-23-000001"
         stale = _make_record_with_securities([RegisteredSecurity(ticker="STALE")])
-        pipeline.save_output([kept, stale])  # daily mode: seeds the existing output
+        pipeline.save_output([kept, stale])
 
-        pipeline.config.ciks = ("1234567",)
         fresh = _make_record_with_securities([RegisteredSecurity(ticker="FRESH")])
         pipeline.save_output([fresh])  # same keys as `stale` — must replace it
 
@@ -805,10 +825,10 @@ class TestSaveOutput:
         assert len(df) == 2
         assert set(df["all_tickers"]) == {"OLD", "FRESH"}
 
-    def test_daily_mode_overwrites_existing_output(
+    def test_output_accumulates_across_runs(
         self, pipeline: CompanyFactsPipeline, tmp_path: pytest.TempPathFactory
     ) -> None:
-        """Without --ciks-override, save_output overwrites as before."""
+        """Records from earlier runs survive later runs (accumulate, not overwrite)."""
         pipeline.config.output_file = str(tmp_path / "out.parquet")
         old = _make_record_with_securities([RegisteredSecurity(ticker="OLD")])
         old.accession_number = "0001234567-23-000001"
@@ -818,7 +838,7 @@ class TestSaveOutput:
         pipeline.save_output([new])
 
         df = pd.read_parquet(pipeline.config.output_file)
-        assert list(df["all_tickers"]) == ["NEW"]
+        assert set(df["all_tickers"]) == {"OLD", "NEW"}
 
     def test_multiple_securities_increments_stat(
         self, pipeline: CompanyFactsPipeline, mocker: MockerFixture

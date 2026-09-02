@@ -109,6 +109,7 @@ class PipelineStats:
 
     # load_input counters
     total_filings: int = 0
+    skipped_filings: int = 0  # already present in the output parquet (resume)
     failed_filings: int = 0
     total_primary_docs: int = 0
     failed_primary_docs: int = 0

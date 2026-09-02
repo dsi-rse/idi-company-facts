@@ -207,19 +207,24 @@ class CompanyFactsPipeline(Pipeline):
             A list of Filing objects that have associated primary documents
         """
         filings: list[Filing] = []
+        existing = self._existing_output_keys()
 
         if self.config.ciks:
-            self._collect_override_filings(filings)
+            self._collect_override_filings(filings, existing)
         elif self.config.allow_list is not None:
             for filing_date, keys in self.config.allow_list.items():
-                self._collect_filings(filing_date, filing_date, keys, filings)
+                self._collect_filings(filing_date, filing_date, keys, filings, existing=existing)
         else:
-            self._collect_filings(self.config.start_date, self.config.end_date, None, filings)
+            self._collect_filings(
+                self.config.start_date, self.config.end_date, None, filings, existing=existing
+            )
 
         self.stats.increment("total_primary_docs", len(filings))
         return filings
 
-    def _collect_override_filings(self, filings: list[Filing]) -> None:
+    def _collect_override_filings(
+        self, filings: list[Filing], existing: frozenset[tuple[str, str]]
+    ) -> None:
         """Resolve each override CIK to its latest target filing and collect it.
 
         Filings whose (cik, accession) pair is already present in the output
@@ -228,12 +233,12 @@ class CompanyFactsPipeline(Pipeline):
 
         Args:
             filings: List to append results to.
+            existing: (normalized cik, accession) pairs already in the output.
         """
         requested = [normalize_cik(cik) for cik in self.config.ciks]
         self.cik_report = {cik: CikOverrideSummary(cik=cik) for cik in requested}
 
         targets = self._latest_filings_by_cik(frozenset(requested))
-        existing = self._existing_output_keys()
 
         # Group remaining targets by filing date so each date needs one manifest query.
         by_date: dict[datetime.date, set[tuple[str, str]]] = {}
@@ -254,6 +259,7 @@ class CompanyFactsPipeline(Pipeline):
             by_date.setdefault(date, set()).add((raw_cik, accession))
 
         for date, keys in sorted(by_date.items()):
+            # existing is empty here: already-in-output targets were excluded above.
             self._collect_filings(date, date, frozenset(keys), filings, search_by="filing_date")
 
     def _latest_filings_by_cik(
@@ -323,6 +329,7 @@ class CompanyFactsPipeline(Pipeline):
         keys: frozenset[tuple[str, str]] | None,
         filings: list[Filing],
         search_by: str = "scraped_date",
+        existing: frozenset[tuple[str, str]] = frozenset(),
     ) -> None:
         """Fetch scraped filings for a date window and append matching Filing objects.
 
@@ -334,6 +341,8 @@ class CompanyFactsPipeline(Pipeline):
             filings: List to append results to.
             search_by: Which manifest date the window filters on ("scraped_date"
                 or "filing_date").
+            existing: (normalized cik, accession) pairs already in the output
+                parquet; matching filings are skipped instead of re-extracted.
         """
         scraped_filings = iter_filings_by_form_type(
             form_types=self.config.form_types or TARGET_FORM_TYPES,
@@ -355,6 +364,14 @@ class CompanyFactsPipeline(Pipeline):
                 continue
 
             self.stats.increment("total_filings")
+
+            if (
+                normalize_cik(scraped_filing.cik),
+                scraped_filing.accession_number,
+            ) in existing:
+                self.stats.increment("skipped_filings")
+                self._report_disposition(scraped_filing.cik, "already_in_output")
+                continue  # resume: already extracted on a previous run
 
             if scraped_filing.failure_reason:
                 self.stats.increment("failed_filings")
@@ -550,12 +567,13 @@ class CompanyFactsPipeline(Pipeline):
             return []
 
     def save_output(self, processed_list: list[CompanyFactsRecord]) -> None:
-        """Persist extracted records to the configured output parquet file.
+        """Merge extracted records into the output parquet file.
 
-        Deduplicates within the current run on (company_cik, accession_number)
-        and writes to the output path, overwriting any existing file. In
-        --ciks-override mode the existing output is merged in instead of
-        overwritten, with this run's rows winning on key collisions.
+        The output accumulates across runs (corporate-structure pattern): new
+        rows are merged with any existing parquet and deduplicated on
+        (company_cik, accession_number), with this run's rows winning on key
+        collisions. load_input skips accessions already in the output, so
+        collisions only occur on deliberate reruns.
 
         Args:
             processed_list: Records returned by :meth:`process`.
@@ -577,13 +595,15 @@ class CompanyFactsPipeline(Pipeline):
             lambda secs: " | ".join(s["security_type"] for s in secs)
         )
         df = df.drop_duplicates(subset=["company_cik", "accession_number"])
-        if self.config.ciks:
-            existing_raw = load_content(self.config.output_file)
-            if existing_raw:
-                existing_df = pd.read_parquet(io.BytesIO(existing_raw))
-                df = pd.concat([existing_df, df], ignore_index=True).drop_duplicates(
-                    subset=["company_cik", "accession_number"], keep="last"
-                )
+        existing_raw = load_content(self.config.output_file)
+        if existing_raw:
+            existing_df = pd.read_parquet(io.BytesIO(existing_raw))
+            self.logger.info(
+                "Merging %d existing records with %d new records", len(existing_df), len(df)
+            )
+            df = pd.concat([existing_df, df], ignore_index=True).drop_duplicates(
+                subset=["company_cik", "accession_number"], keep="last"
+            )
         df.to_parquet(self.config.output_file, index=False)
         self.logger.info("Saved %d records to %s", len(df), self.config.output_file)
 
@@ -594,6 +614,7 @@ class CompanyFactsPipeline(Pipeline):
         self.logger.info("=" * 40)
         self.logger.info("  Filings")
         self.logger.info("    Total:              %d", self.stats.total_filings)
+        self.logger.info("    Already in output:  %d", self.stats.skipped_filings)
         self.logger.info("    Failed upstream:    %d", self.stats.failed_filings)
         self.logger.info("    No primary doc:     %d", self.stats.failed_primary_docs)
         self.logger.info("  Primary Documents")
