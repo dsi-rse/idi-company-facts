@@ -7,6 +7,7 @@ The orchestrator is responsible for running the pipeline.
 import argparse
 import datetime
 import io
+from pathlib import Path
 
 # Third party imports
 import pandas as pd
@@ -14,11 +15,10 @@ from idi_ftm2j_shared.logs import get_logger
 from idi_ftm2j_shared.storage import load_content
 
 # Application imports
-from idi_company_facts.pipeline import CompanyFactsPipeline
+from idi_company_facts.pipeline import SEC_MANIFEST_KEY, CompanyFactsPipeline, normalize_cik
 from idi_company_facts.types import PipelineConfig
 
 DEFAULT_LOOK_BACK: int = 7
-_SEC_MANIFEST_KEY = "sec/manifest.parquet"
 
 
 def valid_date(s: str) -> datetime.date:
@@ -51,6 +51,10 @@ def validate_args(args: argparse.Namespace, parser: argparse.ArgumentParser) -> 
     Returns:
         None
     """
+    if args.ciks_override and args.end_date:
+        parser.error("--end-date cannot be used with --ciks-override")
+    if args.ciks_override and args.look_back is not None:
+        parser.error("--look-back cannot be used with --ciks-override")
     if args.start_date and not args.end_date:
         parser.error("--end-date is required when --start-date is given")
     if args.daily and args.end_date:
@@ -75,7 +79,7 @@ def _get_latest_scraped_date(bucket: str) -> datetime.date:
     Raises:
         ValueError: If the manifest has no usable ``date_scraped`` values.
     """
-    raw = load_content(f"s3://{bucket}/{_SEC_MANIFEST_KEY}")
+    raw = load_content(f"s3://{bucket}/{SEC_MANIFEST_KEY}")
     df = pd.read_parquet(io.BytesIO(raw))
     latest = df["date_scraped"].max()
     if pd.isna(latest):
@@ -138,6 +142,14 @@ def get_args() -> argparse.Namespace:
         metavar="YYYY-MM-DD",
         help="Start of the filing date window (requires --end-date)",
     )
+    date_group.add_argument(
+        "--ciks-override",
+        metavar="PATH",
+        help=(
+            "File of CIKs (one per line, '#' comments allowed); process each "
+            "CIK's most recent scraped target filing instead of a date window"
+        ),
+    )
 
     parser.add_argument(
         "--end-date",
@@ -172,6 +184,40 @@ def get_args() -> argparse.Namespace:
     return args
 
 
+def load_ciks_file(path: str) -> tuple[str, ...]:
+    """Read a --ciks-override file into a deduplicated tuple of normalized CIKs.
+
+    One CIK per line; blank lines and '#' comments are ignored. CIKs are
+    normalized (leading zeros stripped) so spreadsheet-padded values match the
+    manifest's representation.
+
+    Args:
+        path: Path to the CIK list file.
+
+    Returns:
+        Normalized CIKs in first-seen order.
+
+    Raises:
+        ValueError: If a line is not a decimal integer or the file has no CIKs.
+    """
+    ciks: list[str] = []
+    seen: set[str] = set()
+    for line in Path(path).read_text().splitlines():
+        entry = line.split("#", 1)[0].strip()
+        if not entry:
+            continue
+        try:
+            cik = normalize_cik(entry)
+        except ValueError as e:
+            raise ValueError(f"Invalid CIK {entry!r} in {path}") from e
+        if cik not in seen:
+            seen.add(cik)
+            ciks.append(cik)
+    if not ciks:
+        raise ValueError(f"No CIKs found in {path}")
+    return tuple(ciks)
+
+
 def main() -> None:
     """Run the company facts pipeline from the CLI."""
     args = get_args()
@@ -180,8 +226,14 @@ def main() -> None:
     for key, value in vars(args).items():
         logger.info("%s = %r", key, value)
 
-    start_date, end_date = get_dates(args)
-    logger.info("Searching for date range: %s - %s", start_date, end_date)
+    if args.ciks_override:
+        ciks = load_ciks_file(args.ciks_override)
+        start_date = end_date = None
+        logger.info("CIK override mode: %d CIKs from %s", len(ciks), args.ciks_override)
+    else:
+        ciks = None
+        start_date, end_date = get_dates(args)
+        logger.info("Searching for date range: %s - %s", start_date, end_date)
 
     config = PipelineConfig(
         sec_bucket=args.sec_bucket,
@@ -191,6 +243,7 @@ def main() -> None:
         end_date=end_date,
         failure_flush_every=args.failure_flush_every,
         num_workers=args.num_workers,
+        ciks=ciks,
     )
 
     pipeline = CompanyFactsPipeline(config)

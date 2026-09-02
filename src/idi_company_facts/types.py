@@ -72,17 +72,35 @@ class Filing:
 
 @dataclass
 class PipelineConfig:
-    """Configuration for the Company Facts pipeline."""
+    """Configuration for the Company Facts pipeline.
+
+    Exactly one discovery mode applies, checked in this order: ``ciks``
+    (latest target filing per CIK), ``allow_list`` (explicit filings), or the
+    ``start_date``/``end_date`` window. The dates may be None only in the
+    first two modes.
+    """
 
     sec_bucket: str
     output_file: str
     failure_file: str
-    start_date: datetime.date
-    end_date: datetime.date
+    start_date: datetime.date | None = None
+    end_date: datetime.date | None = None
     failure_flush_every: int = 50
     num_workers: int = 10
     allow_list: dict[datetime.date, frozenset[tuple[str, str]]] | None = None
     form_types: tuple[str, ...] | None = None
+    ciks: tuple[str, ...] | None = None
+
+
+@dataclass
+class CikOverrideSummary:
+    """Per-CIK outcome of a --ciks-override run, for the end-of-run report."""
+
+    cik: str  # normalized (no leading zeros)
+    form_type: str = ""
+    filing_date: str = ""  # ISO YYYY-MM-DD, as stored in the manifest
+    accession_number: str = ""
+    disposition: str = "pending"
 
 
 @dataclass
