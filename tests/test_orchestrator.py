@@ -3,6 +3,7 @@
 import argparse
 import sys
 from datetime import date, timedelta
+from pathlib import Path
 
 import pytest
 from pytest_mock import MockerFixture
@@ -11,6 +12,7 @@ from idi_company_facts.orchestrator import (
     DEFAULT_LOOK_BACK,
     get_args,
     get_dates,
+    load_ciks_file,
     valid_date,
     validate_args,
 )
@@ -35,6 +37,7 @@ def make_args(**kwargs: object) -> argparse.Namespace:
         start_date=None,
         end_date=None,
         look_back=None,
+        ciks_override=None,
         sec_bucket="test-bucket",
     )
     defaults.update(kwargs)
@@ -86,6 +89,23 @@ class TestValidateArgs:
     def test_valid_explicit_dates_passes(self) -> None:
         """Matching start/end dates with no look-back passes without error."""
         args = make_args(start_date=date(2024, 1, 1), end_date=date(2024, 1, 31))
+        validate_args(args, self._parser())  # must not raise
+
+    def test_ciks_override_with_end_date_raises(self) -> None:
+        """--end-date is incompatible with --ciks-override."""
+        args = make_args(ciks_override="ciks.txt", end_date=date(2024, 1, 31))
+        with pytest.raises(SystemExit):
+            validate_args(args, self._parser())
+
+    def test_ciks_override_with_look_back_raises(self) -> None:
+        """--look-back is incompatible with --ciks-override."""
+        args = make_args(ciks_override="ciks.txt", look_back=7)
+        with pytest.raises(SystemExit):
+            validate_args(args, self._parser())
+
+    def test_ciks_override_alone_passes(self) -> None:
+        """--ciks-override with no date arguments passes without error."""
+        args = make_args(ciks_override="ciks.txt")
         validate_args(args, self._parser())  # must not raise
 
 
@@ -218,3 +238,66 @@ class TestGetArgs:
         monkeypatch.setattr(sys, "argv", _FULL_ARGS)
         args = get_args()
         assert args.failure_flush_every == 50
+
+    def test_ciks_override_mode(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """--ciks-override is accepted as the alternative to --daily/--start-date."""
+        argv = [a for a in _FULL_ARGS if a != "--daily"] + ["--ciks-override", "ciks.txt"]
+        monkeypatch.setattr(sys, "argv", argv)
+        args = get_args()
+        assert args.ciks_override == "ciks.txt"
+        assert args.daily is False
+
+    def test_ciks_override_excludes_daily(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """--ciks-override and --daily are mutually exclusive."""
+        argv = [*_FULL_ARGS, "--ciks-override", "ciks.txt"]
+        monkeypatch.setattr(sys, "argv", argv)
+        with pytest.raises(SystemExit):
+            get_args()
+
+    def test_ciks_override_excludes_start_date(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """--ciks-override and --start-date are mutually exclusive."""
+        argv = [a for a in _FULL_ARGS if a != "--daily"] + [
+            "--ciks-override",
+            "ciks.txt",
+            "--start-date",
+            "2024-01-01",
+        ]
+        monkeypatch.setattr(sys, "argv", argv)
+        with pytest.raises(SystemExit):
+            get_args()
+
+
+class TestLoadCiksFile:
+    """Tests for the --ciks-override file parser."""
+
+    def _write(self, tmp_path: Path, content: str) -> str:
+        path = tmp_path / "ciks.txt"
+        path.write_text(content)
+        return str(path)
+
+    def test_normalizes_zero_padded_ciks(self, tmp_path: Path) -> None:
+        """Zero-padded spreadsheet CIKs are stripped to the manifest form."""
+        path = self._write(tmp_path, "0000034088\n0000093410\n")
+        assert load_ciks_file(path) == ("34088", "93410")
+
+    def test_ignores_blank_lines_and_comments(self, tmp_path: Path) -> None:
+        """Blank lines and '#' comments (full-line or trailing) are ignored."""
+        path = self._write(tmp_path, "# header\n\n34088  # Exxon\n\n93410\n")
+        assert load_ciks_file(path) == ("34088", "93410")
+
+    def test_deduplicates_preserving_order(self, tmp_path: Path) -> None:
+        """Padded and unpadded duplicates collapse to one entry, first-seen order."""
+        path = self._write(tmp_path, "0000093410\n34088\n93410\n")
+        assert load_ciks_file(path) == ("93410", "34088")
+
+    def test_non_numeric_cik_raises(self, tmp_path: Path) -> None:
+        """A non-numeric line raises ValueError naming the bad entry."""
+        path = self._write(tmp_path, "34088\nnot-a-cik\n")
+        with pytest.raises(ValueError, match="not-a-cik"):
+            load_ciks_file(path)
+
+    def test_empty_file_raises(self, tmp_path: Path) -> None:
+        """A file with no CIKs raises ValueError."""
+        path = self._write(tmp_path, "# only a comment\n")
+        with pytest.raises(ValueError, match="No CIKs"):
+            load_ciks_file(path)
