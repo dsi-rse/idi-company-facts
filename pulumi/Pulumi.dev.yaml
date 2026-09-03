@@ -5,8 +5,7 @@ config:
   idi:cpu: "1024"
   idi:memory: "4096"
   idi:num_workers: "10"
-  # Offset relative to the sec-scraper cron must be confirmed before enabling.
   idi:cron_company_facts: "cron(0 5 * * ? *)"
-  idi:schedule_enabled: "false"
+  idi:schedule_enabled: "true"
   idi:log_retention_days: "30"
   idi:ecr_image_count: "5"
