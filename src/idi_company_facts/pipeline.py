@@ -686,17 +686,21 @@ class CompanyFactsPipeline(Pipeline):
                 if len(record.registered_securities) > 1:
                     self.stats.increment("multiple_registered_securities")
                     self.logger.info(
-                        "%s registered %d securities: %s (common stock: %s)",
+                        "%s registered %d securities: %s",
                         filing.accession_number,
                         len(record.registered_securities),
                         ", ".join(
-                            f"{s.ticker or s.security_name or '<untitled>'}[{s.security_type}]"
+                            s.ticker or s.security_name or s.class_member or "<untitled>"
                             for s in record.registered_securities
                         ),
-                        record.registered_securities[0].ticker
-                        or record.registered_securities[0].security_name
-                        or "<none>",
                     )
+                # Count filings where dimensioned share counts could not be matched to a security.
+                has_unjoined = any(
+                    s.shares_outstanding and not s.security_name and not s.ticker and not s.exchange
+                    for s in record.registered_securities
+                )
+                if has_unjoined:
+                    self.stats.increment("unjoined_share_classes")
             self.stats.increment("extracted_documents", len(records))
             if records:
                 self._report_disposition(filing.cik, filing.accession_number, "processed")
@@ -755,8 +759,19 @@ class CompanyFactsPipeline(Pipeline):
         )
         df["all_tickers"] = securities.map(lambda secs: " | ".join(s["ticker"] for s in secs))
         df["all_exchanges"] = securities.map(lambda secs: " | ".join(s["exchange"] for s in secs))
-        df["all_security_types"] = securities.map(
-            lambda secs: " | ".join(s["security_type"] for s in secs)
+        df["all_class_members"] = securities.map(
+            lambda secs: " | ".join(s["class_member"] for s in secs)
+        )
+        df["all_shares_outstanding"] = securities.map(
+            lambda secs: " | ".join(s["shares_outstanding"] for s in secs)
+        )
+        df["all_shares_outstanding_as_of"] = securities.map(
+            lambda secs: " | ".join(
+                s["shares_outstanding_as_of"].isoformat()
+                if s["shares_outstanding_as_of"] is not None
+                else ""
+                for s in secs
+            )
         )
         df = df.drop_duplicates(subset=["company_cik", "accession_number"])
         existing_raw = load_content(self.config.output_file)
@@ -794,6 +809,7 @@ class CompanyFactsPipeline(Pipeline):
         self.logger.info("    No revenue concept: %d", self.stats.no_revenue_concept)
         self.logger.info("    Ambiguous revenue:  %d", self.stats.ambiguous_revenue)
         self.logger.info("    Multiple securities: %d", self.stats.multiple_registered_securities)
+        self.logger.info("    Unjoined share classes: %d", self.stats.unjoined_share_classes)
         self.logger.info("=" * 40)
         self._display_cik_report()
 

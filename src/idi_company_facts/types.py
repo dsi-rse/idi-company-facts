@@ -5,7 +5,6 @@ import threading
 from dataclasses import dataclass, field
 from datetime import date
 from decimal import Decimal
-from enum import StrEnum
 
 # Single source of truth for which filings carry a primary document
 TARGET_FORM_TYPES = [
@@ -24,17 +23,6 @@ TARGET_FORM_TYPES = [
 ]
 
 
-class SecurityType(StrEnum):
-    """high-level classification of a registered security."""
-
-    COMMON = "common"
-    ADS = "ads"
-    PREFERRED = "preferred"
-    DEBT = "debt"
-    WARRANT = "warrant"
-    OTHER = "other"
-
-
 @dataclass(frozen=True)
 class Context:
     """An iXBRL reporting context."""
@@ -45,6 +33,8 @@ class Context:
     end: datetime.date | None
     has_dimensions: bool
     dimension_members: frozenset[str] = frozenset()
+    # (axis QName, member QName) pairs as written in the document (raw prefixes).
+    dimensions: frozenset[tuple[str, str]] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -147,6 +137,7 @@ class PipelineStats:
     ambiguous_revenue: int = 0
     multiple_registered_securities: int = 0
     recovered_parse: int = 0
+    unjoined_share_classes: int = 0
 
     def __post_init__(self) -> None:
         """Initialize the pipeline stats."""
@@ -168,15 +159,23 @@ class RegisteredSecurity:
     """One security registered under Section 12(b), from the 10K/20F cover page.
 
     Fields map to the DEI concepts dei:Security12bTitle, dei:TradingSymbol,
-    and dei:SecurityExchangeName respectively. Any field may be empty — e.g.
-    registered debt securities often carry a title and exchange but no
-    conventional trading symbol.
+    and dei:SecurityExchangeName respectively. Any field may be empty.
+
+    ``class_member`` is the XBRL member QName on
+    ``us-gaap:StatementClassOfStockAxis`` for this security's context group;
+    empty when the group is dimensionless or has no class-axis member.
+
+    ``shares_outstanding`` and ``shares_outstanding_as_of`` are populated by
+    the attribution step when a dimensioned EntityCommonStockSharesOutstanding
+    fact is matched to this security.
     """
 
     security_name: str = ""
     ticker: str = ""
     exchange: str = ""
-    security_type: SecurityType = SecurityType.OTHER
+    class_member: str = ""
+    shares_outstanding: str = ""
+    shares_outstanding_as_of: datetime.date | None = None
 
 
 @dataclass
@@ -191,8 +190,9 @@ class CompanyFactsRecord:
     filing_date: date | None = None
     report_date: date | None = None  # Fiscal year end of the report
     company_name: str = ""
-    # All registered securities found on the cover page, ranked so the
-    # common-stock class (anchored to EntityCommonStockSharesOutstanding) is first.
+    # All registered securities found on the cover page in extraction order
+    # (dimensionless first, then dimensioned, then appended unmatched share rows).
+    # ``shares_outstanding`` (scalar) holds only a dimensionless fact value.
     registered_securities: list[RegisteredSecurity] = field(default_factory=list)
     market_value: str = ""
     market_value_as_of_date: date | None = None

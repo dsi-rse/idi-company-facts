@@ -190,19 +190,22 @@ def _parse_contexts(root: etree._Element) -> dict[str, Context]:
     contexts: dict[str, Context] = {}
     for ctx in root.iter(f"{{{_XBRLI_NS}}}context"):
         ctx_id = ctx.get("id", "")
-        explicit_members = frozenset(
-            el.text.strip()
+        # Collect (axis, member) pairs from explicitMember elements; raw prefixes preserved.
+        dim_pairs = frozenset(
+            (el.get("dimension", "").strip(), el.text.strip())
             for el in ctx.findall(f".//{{{_XBRLDI_NS}}}explicitMember")
             if el.text and el.text.strip()
         )
-        has_dims = bool(explicit_members) or ctx.find(f".//{{{_XBRLI_NS}}}typedMember") is not None
+        dimension_members = frozenset(m for _, m in dim_pairs)
+        has_dims = bool(dimension_members) or ctx.find(f".//{{{_XBRLI_NS}}}typedMember") is not None
         contexts[ctx_id] = Context(
             context_id=ctx_id,
             instant=_parse_date_el(ctx.find(f".//{{{_XBRLI_NS}}}instant")),
             start=_parse_date_el(ctx.find(f".//{{{_XBRLI_NS}}}startDate")),
             end=_parse_date_el(ctx.find(f".//{{{_XBRLI_NS}}}endDate")),
             has_dimensions=has_dims,
-            dimension_members=explicit_members,
+            dimension_members=dimension_members,
+            dimensions=dim_pairs,
         )
     return contexts
 
