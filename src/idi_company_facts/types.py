@@ -35,6 +35,8 @@ class Context:
     dimension_members: frozenset[str] = frozenset()
     # (axis QName, member QName) pairs as written in the document (raw prefixes).
     dimensions: frozenset[tuple[str, str]] = frozenset()
+    # Axis QNames from typedMember elements (values are free-form XML, not stored).
+    typed_axes: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -161,9 +163,9 @@ class RegisteredSecurity:
     Fields map to the DEI concepts dei:Security12bTitle, dei:TradingSymbol,
     and dei:SecurityExchangeName respectively. Any field may be empty.
 
-    ``class_member`` is the XBRL member QName on
-    ``us-gaap:StatementClassOfStockAxis`` for this security's context group;
-    empty when the group is dimensionless or has no class-axis member.
+    ``dimensioned_members`` holds the class-axis member QName for class-axis
+    securities; sorted explicit member QNames joined ``"; "`` for unmatched
+    opaque rows; and ``""`` for dimensionless securities and typed-member rows.
 
     ``shares_outstanding`` and ``shares_outstanding_as_of`` are populated by
     the attribution step when a dimensioned EntityCommonStockSharesOutstanding
@@ -173,7 +175,7 @@ class RegisteredSecurity:
     security_name: str = ""
     ticker: str = ""
     exchange: str = ""
-    class_member: str = ""
+    dimensioned_members: str = ""
     shares_outstanding: str = ""
     shares_outstanding_as_of: datetime.date | None = None
 

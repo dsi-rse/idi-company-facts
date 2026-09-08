@@ -197,7 +197,12 @@ def _parse_contexts(root: etree._Element) -> dict[str, Context]:
             if el.text and el.text.strip()
         )
         dimension_members = frozenset(m for _, m in dim_pairs)
-        has_dims = bool(dimension_members) or ctx.find(f".//{{{_XBRLI_NS}}}typedMember") is not None
+        typed_axes = frozenset(
+            ax
+            for el in ctx.findall(f".//{{{_XBRLI_NS}}}typedMember")
+            if (ax := el.get("dimension", "").strip())
+        )
+        has_dims = bool(dimension_members) or bool(typed_axes)
         contexts[ctx_id] = Context(
             context_id=ctx_id,
             instant=_parse_date_el(ctx.find(f".//{{{_XBRLI_NS}}}instant")),
@@ -206,6 +211,7 @@ def _parse_contexts(root: etree._Element) -> dict[str, Context]:
             has_dimensions=has_dims,
             dimension_members=dimension_members,
             dimensions=dim_pairs,
+            typed_axes=typed_axes,
         )
     return contexts
 

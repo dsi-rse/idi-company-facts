@@ -272,8 +272,8 @@ class TestSharesAndSecurities:
         assert securities[0].security_name == "Common Stock, $0.001 par value"
         assert securities[0].ticker == "AAPL"
         assert securities[0].exchange == "NASDAQ"
-        # Dimensionless context: class_member is empty; shares attributed to scalar only.
-        assert securities[0].class_member == ""
+        # Dimensionless context: dimensioned_members is empty; shares attributed to scalar only.
+        assert securities[0].dimensioned_members == ""
         assert securities[0].shares_outstanding == ""
 
     def test_no_ticker_returns_empty_strings(self, extractor: CompanyFactsExtractor) -> None:
@@ -305,9 +305,9 @@ class TestSharesAndSecurities:
         assert date_ is None
         # Both counts are unmatched (no 12b securities) → two appended rows.
         assert len(securities) == 2
-        class_members = {s.class_member for s in securities}
-        assert "us-gaap:CommonClassAMember" in class_members
-        assert "us-gaap:CommonClassBMember" in class_members
+        dim_members = {s.dimensioned_members for s in securities}
+        assert "us-gaap:CommonClassAMember" in dim_members
+        assert "us-gaap:CommonClassBMember" in dim_members
         for s in securities:
             assert s.shares_outstanding != ""
 
@@ -327,12 +327,12 @@ class TestSharesAndSecurities:
         assert securities[0].ticker == "SONO"
         assert securities[0].exchange == "Nasdaq Global Select Market"
 
-    def test_dimensioned_shares_attributed_via_class_member(
+    def test_dimensioned_shares_attributed_via_dimensioned_members(
         self, extractor: CompanyFactsExtractor
     ) -> None:
         # Shares outstanding in dimensional class-A context; DEI facts in a
         # separate class-A context (different ctx_id, same member).
-        # The attribution must match by class_member equality, not ctx_id.
+        # The attribution must match by dimensioned_members equality, not ctx_id.
         class_a_shares_ctx = """
         <xbrli:context id="c-shares-a">
           <xbrli:entity>
@@ -376,7 +376,7 @@ class TestSharesAndSecurities:
         assert securities[0].ticker == "ADTA"
         assert securities[0].exchange == "NYSE"
         assert securities[0].security_name == "Class A Common Stock"
-        assert securities[0].class_member == "us-gaap:CommonClassAMember"
+        assert securities[0].dimensioned_members == "us-gaap:CommonClassAMember"
         # Shares attributed to the matched security.
         assert securities[0].shares_outstanding == "1000000"
         assert securities[0].shares_outstanding_as_of == datetime.date(2024, 9, 28)
@@ -502,7 +502,7 @@ class TestAttributionCases:
         appended = next(s for s in securities if not s.ticker)
         assert googl.shares_outstanding == "5000000000"
         assert goog.shares_outstanding == "900000000"
-        assert appended.class_member == "us-gaap:CommonClassCMember"
+        assert appended.dimensioned_members == "us-gaap:CommonClassCMember"
         assert appended.shares_outstanding == "50000000"
 
     def test_snail_shape(self, extractor: CompanyFactsExtractor) -> None:
@@ -722,17 +722,17 @@ class TestAttributionCases:
         )
         shares, _, securities = extractor._shares_and_securities(doc)
         assert shares is None
-        # Opaque count unmatched → appended row with class_member="us-gaap:SubsidiaryMember".
+        # Opaque count unmatched → appended row with dimensioned_members="us-gaap:SubsidiaryMember".
         appended = [s for s in securities if not s.ticker]
         assert len(appended) == 1
         assert appended[0].shares_outstanding == "99999"
-        assert "SubsidiaryMember" in appended[0].class_member
+        assert "SubsidiaryMember" in appended[0].dimensioned_members
 
     def test_class_axis_extraction_ignores_other_axes(
         self, extractor: CompanyFactsExtractor
     ) -> None:
         # Context has class-axis member + second unrelated axis member.
-        # class_member should only capture the StatementClassOfStockAxis member.
+        # dimensioned_members should only capture the StatementClassOfStockAxis member.
         ctx_two_axes = """
         <xbrli:context id="c-two-axes">
           <xbrli:entity>
@@ -751,12 +751,13 @@ class TestAttributionCases:
         doc = InlineXbrlDocument(make_ixbrl_bytes(contexts=ctx_two_axes, facts=facts))
         _, _, securities = extractor._shares_and_securities(doc)
         assert len(securities) == 1
-        assert securities[0].class_member == "us-gaap:CommonClassAMember"
+        assert securities[0].dimensioned_members == "us-gaap:CommonClassAMember"
 
-    def test_typed_member_only_count_appended_with_empty_member(
+    def test_typed_member_only_count_appended_with_axis_name(
         self, extractor: CompanyFactsExtractor
     ) -> None:
-        # A shares count in a typed-member context cannot be attributed → appended, class_member="".
+        # A shares count in a typed-member context cannot be attributed → appended
+        # with dimensioned_members set to the typed axis QName.
         typed_ctx = """
         <xbrli:context id="c-typed">
           <xbrli:entity>
@@ -778,14 +779,14 @@ class TestAttributionCases:
         assert shares is None
         appended = [s for s in securities if not s.ticker]
         assert len(appended) == 1
-        assert appended[0].class_member == ""
+        assert appended[0].dimensioned_members == "us-gaap:Axis"
         assert appended[0].shares_outstanding == "55555"
 
     def test_opaque_non_class_axis_count_appended_sorted_members(
         self, extractor: CompanyFactsExtractor
     ) -> None:
         # Shares count on a non-class-axis only, no matching security.
-        # Appended row; class_member = sorted members joined "; ".
+        # Appended row; dimensioned_members = sorted members joined "; ".
         opaque_ctx = """
         <xbrli:context id="c-opaque">
           <xbrli:entity>
@@ -807,8 +808,8 @@ class TestAttributionCases:
         assert shares is None
         appended = [s for s in securities if not s.ticker]
         assert len(appended) == 1
-        # class_member must not contain " | " (opaque separator is "; ").
-        assert " | " not in appended[0].class_member
+        # dimensioned_members must not contain " | " (opaque separator is "; ").
+        assert " | " not in appended[0].dimensioned_members
         assert appended[0].shares_outstanding == "77777"
 
     def test_alignment_invariant(self, extractor: CompanyFactsExtractor) -> None:
@@ -844,7 +845,7 @@ class TestAttributionCases:
             [s.security_name for s in securities],
             [s.ticker for s in securities],
             [s.exchange for s in securities],
-            [s.class_member for s in securities],
+            [s.dimensioned_members for s in securities],
             [s.shares_outstanding for s in securities],
             [s.shares_outstanding_as_of for s in securities],
         ]
@@ -873,10 +874,10 @@ class TestRegisteredSecurities:
         assert len(securities) == 2
         assert securities[0].ticker == "ORD"
         assert securities[0].exchange == "Euronext Paris"
-        assert securities[0].class_member == ""  # dimensionless
+        assert securities[0].dimensioned_members == ""  # dimensionless
         assert securities[1].ticker == "ADSX"
         assert securities[1].exchange == "NYSE"
-        assert securities[1].class_member == "us-gaap:AmericanDepositarySharesMember"
+        assert securities[1].dimensioned_members == "us-gaap:AmericanDepositarySharesMember"
 
     def test_document_order_for_dimensioned(self, extractor: CompanyFactsExtractor) -> None:
         # Two dimensioned securities; document order (first seen) determines order.
@@ -923,7 +924,7 @@ class TestRegisteredSecurities:
         _, _, securities = extractor._shares_and_securities(doc)
         # Class A DEI facts appear first in document → Class A is first.
         assert [s.ticker for s in securities] == ["DUAL.A", "DUAL.B"]
-        # Class B gets its share count attributed via class_member match.
+        # Class B gets its share count attributed via dimensioned_members match.
         clb = next(s for s in securities if s.ticker == "DUAL.B")
         assert clb.shares_outstanding == "1000"
 
@@ -1004,7 +1005,7 @@ class TestRegisteredSecurities:
         )
         _, _, securities = extractor._shares_and_securities(doc)
         assert len(securities) == 2
-        members = {s.class_member for s in securities}
+        members = {s.dimensioned_members for s in securities}
         assert "us-gaap:OrdinarySharesMember" in members
         assert "us-gaap:AmericanDepositarySharesMember" in members
 
@@ -1072,7 +1073,7 @@ class TestRegisteredSecurities:
         assert securities[1].ticker == "ADSX"
         assert securities[1].shares_outstanding == "500000000"
 
-    def test_dedupe_keeps_class_member(self, extractor: CompanyFactsExtractor) -> None:
+    def test_dedupe_keeps_dimensioned_members(self, extractor: CompanyFactsExtractor) -> None:
         # Ticker XYZ tagged dimensionlessly and dimensionally; two distinct entries.
         mixed_facts = (
             '<p><ix:nonFraction name="dei:EntityCommonStockSharesOutstanding" contextRef="c-instant"'
@@ -1091,8 +1092,8 @@ class TestRegisteredSecurities:
         )
         _, _, securities = extractor._shares_and_securities(doc)
         assert len(securities) == 2
-        # Dimensionless entry has empty class_member; dimensional has ADS member.
-        members = {s.class_member for s in securities}
+        # Dimensionless entry has empty dimensioned_members; dimensional has ADS member.
+        members = {s.dimensioned_members for s in securities}
         assert "" in members
         assert "us-gaap:AmericanDepositarySharesMember" in members
 

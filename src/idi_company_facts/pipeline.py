@@ -690,7 +690,7 @@ class CompanyFactsPipeline(Pipeline):
                         filing.accession_number,
                         len(record.registered_securities),
                         ", ".join(
-                            s.ticker or s.security_name or s.class_member or "<untitled>"
+                            s.ticker or s.security_name or s.dimensioned_members or "<untitled>"
                             for s in record.registered_securities
                         ),
                     )
@@ -759,8 +759,8 @@ class CompanyFactsPipeline(Pipeline):
         )
         df["all_tickers"] = securities.map(lambda secs: " | ".join(s["ticker"] for s in secs))
         df["all_exchanges"] = securities.map(lambda secs: " | ".join(s["exchange"] for s in secs))
-        df["all_class_members"] = securities.map(
-            lambda secs: " | ".join(s["class_member"] for s in secs)
+        df["all_dimensioned_members"] = securities.map(
+            lambda secs: " | ".join(s["dimensioned_members"] for s in secs)
         )
         df["all_shares_outstanding"] = securities.map(
             lambda secs: " | ".join(s["shares_outstanding"] for s in secs)

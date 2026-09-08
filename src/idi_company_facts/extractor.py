@@ -199,9 +199,9 @@ class CompanyFactsExtractor:
         Groups dimensioned EntityCommonStockSharesOutstanding facts by their
         class-axis member (or full member set for opaque contexts).  Takes the
         latest-instant fact per group, then matches it to a registered security
-        via exact class_member equality or member-set containment.  Unmatched
-        groups are appended as stub securities; typed-member contexts are
-        appended with an empty class_member.
+        via exact dimensioned_members equality or member-set containment.
+        Unmatched groups are appended as stub securities; typed-member contexts
+        are appended with an empty dimensioned_members.
         """
         dim_facts = [
             f
@@ -244,7 +244,7 @@ class CompanyFactsExtractor:
             bf = _best(facts)
             matched_idx = None
             for i, (_members, sec) in enumerate(sec_list):
-                if sec.class_member == cm:
+                if sec.dimensioned_members == cm:
                     matched_idx = i
                     break
             if matched_idx is None:
@@ -264,7 +264,7 @@ class CompanyFactsExtractor:
             else:
                 appended.append(
                     RegisteredSecurity(
-                        class_member=cm,
+                        dimensioned_members=cm,
                         shares_outstanding=_fmt(bf.value),
                         shares_outstanding_as_of=bf.context.instant,
                     )
@@ -294,7 +294,7 @@ class CompanyFactsExtractor:
                 opaque_cm = "; ".join(sorted(member_set))
                 appended.append(
                     RegisteredSecurity(
-                        class_member=opaque_cm,
+                        dimensioned_members=opaque_cm,
                         shares_outstanding=_fmt(bf.value),
                         shares_outstanding_as_of=bf.context.instant,
                     )
@@ -302,11 +302,13 @@ class CompanyFactsExtractor:
                 n_unmatched += 1
                 unmatched_details.append(f"opaque({opaque_cm})={_fmt(bf.value)}")
 
-        # Typed-member-only contexts: append with empty class_member.
+        # Typed-member-only contexts: append with axis QName(s) as dimensioned_members.
         if typed_member_facts:
             bf = _best(typed_member_facts)
+            typed_dm = "; ".join(sorted(bf.context.typed_axes))
             appended.append(
                 RegisteredSecurity(
+                    dimensioned_members=typed_dm,
                     shares_outstanding=_fmt(bf.value),
                     shares_outstanding_as_of=bf.context.instant,
                 )
@@ -414,12 +416,12 @@ class CompanyFactsExtractor:
         name = " ".join(slot.get(SECURITY_12B_TITLE, "").split())
         if not (ticker or exchange or name):
             return None
-        class_member = _class_member_from_dimensions(dimensions)
+        dim_members = _class_member_from_dimensions(dimensions)
         return RegisteredSecurity(
             security_name=name,
             ticker=ticker,
             exchange=exchange,
-            class_member=class_member,
+            dimensioned_members=dim_members,
         )
 
     @staticmethod
@@ -430,7 +432,7 @@ class CompanyFactsExtractor:
 
         Keyed by (ticker, members) for ticker-bearing securities, or
         (name, exchange) for ticker-less ones.  When duplicates collide each
-        field takes the first non-empty value; class_member likewise.
+        field takes the first non-empty value; dimensioned_members likewise.
         """
         by_key: dict[tuple, tuple[frozenset[str], RegisteredSecurity]] = {}
         for members, sec in entries:
@@ -448,7 +450,7 @@ class CompanyFactsExtractor:
                 security_name=ex_sec.security_name or sec.security_name,
                 ticker=ex_sec.ticker or sec.ticker,
                 exchange=ex_sec.exchange or sec.exchange,
-                class_member=ex_sec.class_member or sec.class_member,
+                dimensioned_members=ex_sec.dimensioned_members or sec.dimensioned_members,
             )
             by_key[key] = (ex_members | members, merged_sec)
         return list(by_key.values())

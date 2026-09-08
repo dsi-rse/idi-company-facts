@@ -1000,7 +1000,7 @@ class TestSaveOutput:
             security_name="Common Stock",
             ticker="AAPL",
             exchange="NASDAQ",
-            class_member="us-gaap:CommonStockMember",
+            dimensioned_members="us-gaap:CommonStockMember",
         )
         record = _make_record_with_securities([sec])
 
@@ -1010,7 +1010,7 @@ class TestSaveOutput:
         assert df["all_tickers"].iloc[0] == "AAPL"
         assert df["all_security_names"].iloc[0] == "Common Stock"
         assert df["all_exchanges"].iloc[0] == "NASDAQ"
-        assert df["all_class_members"].iloc[0] == "us-gaap:CommonStockMember"
+        assert df["all_dimensioned_members"].iloc[0] == "us-gaap:CommonStockMember"
         assert df["all_shares_outstanding"].iloc[0] == ""
         assert df["all_shares_outstanding_as_of"].iloc[0] == ""
 
@@ -1023,13 +1023,13 @@ class TestSaveOutput:
             security_name="Ordinary Shares",
             ticker="ORD",
             exchange="Euronext Paris",
-            class_member="",
+            dimensioned_members="",
         )
         ads = RegisteredSecurity(
             security_name="American Depositary Shares",
             ticker="ADSX",
             exchange="NYSE",
-            class_member="us-gaap:AmericanDepositarySharesMember",
+            dimensioned_members="us-gaap:AmericanDepositarySharesMember",
             shares_outstanding="500000000",
         )
         record = _make_record_with_securities([common, ads])
@@ -1040,7 +1040,7 @@ class TestSaveOutput:
         assert df["all_tickers"].iloc[0] == "ORD | ADSX"
         assert df["all_security_names"].iloc[0] == "Ordinary Shares | American Depositary Shares"
         assert df["all_exchanges"].iloc[0] == "Euronext Paris | NYSE"
-        assert df["all_class_members"].iloc[0] == " | us-gaap:AmericanDepositarySharesMember"
+        assert df["all_dimensioned_members"].iloc[0] == " | us-gaap:AmericanDepositarySharesMember"
         assert df["all_shares_outstanding"].iloc[0] == " | 500000000"
 
     def test_registered_securities_column_absent(
@@ -1060,21 +1060,21 @@ class TestSaveOutput:
     def test_three_securities_class_members_pipe_delimited(
         self, pipeline: CompanyFactsPipeline, tmp_path: pytest.TempPathFactory
     ) -> None:
-        """Three-security fixture produces pipe-delimited all_class_members."""
+        """Three-security fixture produces pipe-delimited all_dimensioned_members."""
         pipeline.config.output_file = str(tmp_path / "out.parquet")
         secs = [
-            RegisteredSecurity(ticker="ORD", class_member=""),
+            RegisteredSecurity(ticker="ORD", dimensioned_members=""),
             RegisteredSecurity(
-                ticker="ADSX", class_member="us-gaap:AmericanDepositarySharesMember"
+                ticker="ADSX", dimensioned_members="us-gaap:AmericanDepositarySharesMember"
             ),
-            RegisteredSecurity(ticker="ORD27", class_member="us-gaap:SeniorNotesMember"),
+            RegisteredSecurity(ticker="ORD27", dimensioned_members="us-gaap:SeniorNotesMember"),
         ]
         record = _make_record_with_securities(secs)
 
         pipeline.save_output([record])
 
         df = pd.read_parquet(pipeline.config.output_file)
-        assert df["all_class_members"].iloc[0] == (
+        assert df["all_dimensioned_members"].iloc[0] == (
             " | us-gaap:AmericanDepositarySharesMember | us-gaap:SeniorNotesMember"
         )
 
