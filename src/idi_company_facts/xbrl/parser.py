@@ -7,7 +7,7 @@ from decimal import Decimal, InvalidOperation
 from idi_ftm2j_shared.logs import get_logger
 from lxml import etree
 
-from idi_company_facts.types import Context, Fact
+from idi_company_facts.types import Context, Dimension, Fact
 
 # Namespace URIs
 _XBRLI_NS = "http://www.xbrl.org/2003/instance"
@@ -190,32 +190,26 @@ def _parse_contexts(root: etree._Element) -> dict[str, Context]:
     contexts: dict[str, Context] = {}
     for ctx in root.iter(f"{{{_XBRLI_NS}}}context"):
         ctx_id = ctx.get("id", "")
-        # Collect (axis, member) pairs from explicitMember elements; raw prefixes preserved.
-        dim_pairs = frozenset(
-            (el.get("dimension", "").strip(), el.text.strip())
+        dims: list[Dimension] = [
+            Dimension(axis=el.get("dimension", "").strip(), member=el.text.strip(), is_typed=False)
             for el in ctx.findall(f".//{{{_XBRLDI_NS}}}explicitMember")
             if el.text and el.text.strip()
-        )
-        dimension_members = frozenset(m for _, m in dim_pairs)
-        typed_dims: list[tuple[str, str]] = []
+        ]
         for el in ctx.findall(f".//{{{_XBRLDI_NS}}}typedMember"):
             ax = el.get("dimension", "").strip()
             if not ax:
                 continue
             child = next(iter(el), None)
             value = (child.text or "").strip() if child is not None else ""
-            typed_dims.append((ax, value))
-        typed_dimensions = frozenset(typed_dims)
-        has_dims = bool(dimension_members) or bool(typed_dimensions)
+            dims.append(Dimension(axis=ax, member=value, is_typed=True))
+        dimensions = frozenset(dims)
         contexts[ctx_id] = Context(
             context_id=ctx_id,
             as_of_date=_parse_date_el(ctx.find(f".//{{{_XBRLI_NS}}}instant")),
             start=_parse_date_el(ctx.find(f".//{{{_XBRLI_NS}}}startDate")),
             end=_parse_date_el(ctx.find(f".//{{{_XBRLI_NS}}}endDate")),
-            has_dimensions=has_dims,
-            dimension_members=dimension_members,
-            dimensions=dim_pairs,
-            typed_dimensions=typed_dimensions,
+            has_dimensions=bool(dimensions),
+            dimensions=dimensions,
         )
     return contexts
 

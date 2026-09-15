@@ -24,6 +24,22 @@ TARGET_FORM_TYPES = [
 
 
 @dataclass(frozen=True)
+class Dimension:
+    """One (axis, member) pair from an iXBRL context dimension.
+
+    Both explicit and typed members are represented identically.  The only
+    difference is the member value: for explicit members it is a QName
+    referencing a named concept in a taxonomy (``prefix:localName`` format);
+    for typed members it is a free-form string constrained by an XML Schema
+    type.
+    """
+
+    axis: str  # axis QName, e.g. "us-gaap:StatementClassOfStockAxis"
+    member: str  # taxonomy concept QName (explicit) or free-form string (typed)
+    is_typed: bool = False
+
+
+@dataclass(frozen=True)
 class Context:
     """An iXBRL reporting context."""
 
@@ -32,11 +48,7 @@ class Context:
     start: datetime.date | None
     end: datetime.date | None
     has_dimensions: bool
-    dimension_members: frozenset[str] = frozenset()
-    # (axis QName, member QName) pairs as written in the document (raw prefixes).
-    dimensions: frozenset[tuple[str, str]] = frozenset()
-    # (axis QName, child text value) pairs from typedMember elements.
-    typed_dimensions: frozenset[tuple[str, str]] = frozenset()
+    dimensions: frozenset[Dimension] = frozenset()
 
 
 @dataclass(frozen=True)
