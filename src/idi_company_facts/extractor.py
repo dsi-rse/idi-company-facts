@@ -37,9 +37,6 @@ _SECURITY_CONCEPTS = (TRADING_SYMBOL, SECURITY_EXCHANGE_NAME, SECURITY_12B_TITLE
 # Placeholder TradingSymbol values that indicate no listed security.
 _PLACEHOLDER_TICKERS = frozenset({"none", "-", "n/a", "not applicable"})
 
-# Local name of the class-of-stock axis used to attribute share counts.
-_CLASS_STOCK_AXIS_LOCAL = "StatementClassOfStockAxis"
-
 
 def _fmt(value: Decimal) -> str:
     """Format a Decimal as a plain integer string when the value is whole."""
@@ -52,14 +49,12 @@ def _normalize_ticker(raw: str) -> str:
     return "" if ticker.lower() in _PLACEHOLDER_TICKERS else ticker
 
 
-def _class_member_from_dimensions(dimensions: frozenset[tuple[str, str]]) -> str:
-    """Return the class-of-stock axis member QName, or empty if absent or ambiguous.
+def _format_dimensions(dimensions: frozenset[tuple[str, str]]) -> str:
+    """Format (axis, member) pairs as a sorted ``axis=member`` string.
 
-    Matches the axis by local name so non-standard namespace prefixes are handled.
-    Returns empty if there are zero or more than one class-axis member pairs.
+    Multiple pairs are joined by ``"; "``.  Empty frozenset returns ``""``.
     """
-    members = [m for axis, m in dimensions if axis.split(":")[-1] == _CLASS_STOCK_AXIS_LOCAL]
-    return members[0] if len(members) == 1 else ""
+    return "; ".join(f"{ax}={mb}" for ax, mb in sorted(dimensions))
 
 
 class CompanyFactsExtractor:
@@ -70,21 +65,34 @@ class CompanyFactsExtractor:
 
     def extract(
         self, filing: Filing, doc: InlineXbrlDocument
-    ) -> tuple[list[CompanyFactsRecord], list[FailureType]]:
+    ) -> tuple[CompanyFactsRecord, list[FailureType], int, int]:
         """Map one (filing, document) pair to exactly one CompanyFactsRecord.
 
         All securities registered under Section 12(b) on the cover page are
-        collected into ``registered_securities`` in extraction order (dimensionless
-        first, dimensioned second, appended unmatched share rows last).
+        collected into ``registered_securities`` in extraction order.
+        Unmatched share count rows (i.e. only share count reported, no security with matching
+        dimension) appended at the end of the securities extracted from the Section 12(b) table.
 
         Args:
             filing: Metadata from the SEC scraper (CIK, dates, URLs).
             doc: Parsed iXBRL document for the filing's primary annual exhibit.
 
         Returns:
-            A tuple of (records, failures) where records is a single-element list
-            containing the extracted :class:`CompanyFactsRecord` and failures is a
-            list of :class:`FailureType` values for non-fatal extraction issues.
+            A tuple of (record, failures, n_unmatched_explicit, n_unmatched_typed).
+
+            ``n_unmatched_explicit``: count of explicit-member share groups with no matching
+            registered security.  An explicit-member context tags its dimension using a
+            standard QName member (``xbrli:explicitMember``), so each (axis, member) pair
+            is a known concept.  Groups are keyed by the full frozenset of (axis, member)
+            pairs; a group with no matching security becomes a stub row.
+
+            ``n_unmatched_typed``: count of typed-member share groups with no matching
+            registered security.  A typed-member context (``xbrli:typedMember``) identifies
+            the axis by QName but the member value is free-form XML — not a concept QName —
+            so it cannot be matched to a registered security.  Groups are keyed by the
+            frozenset of axis QNames; each distinct axis set becomes one stub row.
+
+            Both counters are incremented once per unmatched group, not once per fact.
         """
         period_end = self._period_end(doc)
         market_value, mv_date, mv_currency = self._market_value(doc)
@@ -92,7 +100,14 @@ class CompanyFactsExtractor:
         revenue, rev_date, rev_currency, rev_ambiguous = self._revenue(doc, period_end)
         registrant = self._registrant_name(doc) or filing.company_name
 
-        shares, shares_date, securities = self._shares_and_securities(doc, filing.accession_number)
+        (
+            shares,
+            shares_date,
+            securities,
+            ambiguous_shares,
+            n_unmatched_explicit,
+            n_unmatched_typed,
+        ) = self._shares_and_securities(doc, filing.accession_number)
 
         failures: list[FailureType] = []
         if period_end is None:
@@ -101,6 +116,8 @@ class CompanyFactsExtractor:
             failures.append(FailureType.NO_REVENUE_CONCEPT)
         elif rev_ambiguous:
             failures.append(FailureType.AMBIGUOUS_REVENUE)
+        if ambiguous_shares:
+            failures.append(FailureType.AMBIGUOUS_SHARES_OUTSTANDING)
 
         now = datetime.datetime.now(datetime.UTC)
         record = CompanyFactsRecord(
@@ -124,7 +141,7 @@ class CompanyFactsExtractor:
             revenue_currency=rev_currency or "",
             last_accessed=now,
         )
-        return [record], failures
+        return record, failures, n_unmatched_explicit, n_unmatched_typed
 
     def _period_end(self, doc: InlineXbrlDocument) -> datetime.date | None:
         """Return DocumentPeriodEndDate as a date, or None if absent or unparseable."""
@@ -149,25 +166,34 @@ class CompanyFactsExtractor:
     def _market_value(
         self, doc: InlineXbrlDocument
     ) -> tuple[Decimal | None, datetime.date | None, str | None]:
-        """Return (public float, instant date, currency), all None if absent."""
+        """Return (public float, as-of date, currency), all None if absent."""
         fact = doc.single_fact(PUBLIC_FLOAT)
         if fact is None or not isinstance(fact.value, Decimal):
             return None, None, None
-        return fact.value, fact.context.instant, fact.unit
+        return fact.value, fact.context.as_of_date, fact.unit
 
     def _shares_and_securities(
         self, doc: InlineXbrlDocument, accession_number: str = ""
-    ) -> tuple[Decimal | None, datetime.date | None, list[RegisteredSecurity]]:
-        """Return (scalar_shares, as_of_date, securities_with_attributed_counts).
+    ) -> tuple[Decimal | None, datetime.date | None, list[RegisteredSecurity], bool, int, int]:
+        """Takes security facts from the document and matches them per dimension.
 
-        Scalar: the value of a dimensionless EntityCommonStockSharesOutstanding
-        fact at the latest instant.  Empty when no dimensionless fact exists —
-        the scalar is NEVER computed by summing dimensioned facts.
+        Return (scalar, as_of_date, securities, ambiguous_shares, n_unmatched_explicit, n_unmatched_typed).
 
-        Securities: all Section 12(b) securities in extraction order, with
-        dimensioned share counts attributed per class via
-        :meth:`_attribute_shares`.  Unmatched dimensioned counts are appended
-        as member-only rows after the table rows.
+        scalar: dimensionless EntityCommonStockSharesOutstanding at the latest as-of date,
+        or None.  Its relationship to per-security counts is unresolvable here.
+
+        ambiguous_shares: True when two dimensionless facts share the same latest instant
+        but disagree on value.
+
+        securities: all Section 12(b) securities in extraction order, with dimensioned
+        share counts attributed by :meth:`_attribute_shares`.  Unmatched groups are
+        appended as stub rows with empty name/ticker/exchange.
+
+        n_unmatched_explicit: count of explicit-member share groups with no matching
+        registered security, incremented once per group.
+
+        n_unmatched_typed: count of typed-member share groups (distinct typed_dimensions sets)
+        with no matching registered security, incremented once per group.
         """
         shares_facts = [
             f
@@ -175,82 +201,102 @@ class CompanyFactsExtractor:
             if not f.context.has_dimensions and isinstance(f.value, Decimal)
         ]
 
+        ambiguous_shares = False
         if shares_facts:
-            fact = max(shares_facts, key=lambda f: f.context.instant or datetime.date.min)
+            latest_as_of = max(f.context.as_of_date or datetime.date.min for f in shares_facts)
+            latest_facts = [
+                f
+                for f in shares_facts
+                if (f.context.as_of_date or datetime.date.min) == latest_as_of
+            ]
+            if len({f.value for f in latest_facts}) > 1:
+                ambiguous_shares = True
+                _logger.info(
+                    "%s: ambiguous dimensionless shares at %s — %s; using first value",
+                    accession_number,
+                    latest_as_of,
+                    ", ".join(_fmt(f.value) for f in latest_facts),
+                )
+            fact = latest_facts[0]
             shares_value: Decimal | None = fact.value
-            shares_date: datetime.date | None = fact.context.instant
+            shares_date: datetime.date | None = fact.context.as_of_date
         else:
             shares_value = None
             shares_date = None
 
         entries = self._registered_securities(doc)
-        securities = self._attribute_shares(doc, entries, accession_number, shares_value)
-        return shares_value, shares_date, securities
+        securities, n_unmatched_explicit, n_unmatched_typed = self._attribute_shares(
+            doc, entries, accession_number, shares_value
+        )
+        return (
+            shares_value,
+            shares_date,
+            securities,
+            ambiguous_shares,
+            n_unmatched_explicit,
+            n_unmatched_typed,
+        )
 
     def _attribute_shares(
         self,
         doc: InlineXbrlDocument,
-        entries: list[tuple[frozenset[str], RegisteredSecurity]],
+        entries: list[tuple[frozenset[tuple[str, str]], RegisteredSecurity]],
         accession_number: str = "",
         scalar: Decimal | None = None,
-    ) -> list[RegisteredSecurity]:
+    ) -> tuple[list[RegisteredSecurity], int, int]:
         """Attribute dimensioned share counts to securities; append unmatched rows.
 
         Groups dimensioned EntityCommonStockSharesOutstanding facts by their
-        class-axis member (or full member set for opaque contexts).  Takes the
-        latest-instant fact per group, then matches it to a registered security
-        via exact dimensioned_members equality or member-set containment.
-        Unmatched groups are appended as stub securities; typed-member contexts
-        are appended with an empty dimensioned_members.
+        full (axis, member) pair-set.  Takes the latest as-of-date fact per group,
+        then matches it to a registered security whose stored pair-set is equal.
+        Unmatched groups are appended as stub securities.
+
+        Returns:
+            (securities, n_unmatched_explicit, n_unmatched_typed) where
+            n_unmatched_explicit is the count of explicit-member groups with no
+            matching registered security, and n_unmatched_typed is the count of
+            typed-member groups (grouped by typed_axes frozenset) with no matching
+            registered security.  Each counter is incremented once per unmatched
+            group, not once per fact.
         """
         dim_facts = [
             f
             for f in doc.facts(SHARES_OUTSTANDING)
             if f.context.has_dimensions
             and isinstance(f.value, Decimal)
-            and f.context.instant is not None
+            and f.context.as_of_date is not None
         ]
 
         if not dim_facts:
-            return [sec for _, sec in entries]
+            return [sec for _, sec in entries], 0, 0
 
         # Partition dim_facts by group type.
-        class_axis_groups: dict[str, list] = {}
-        opaque_groups: dict[frozenset[str], list] = {}
-        typed_member_facts: list = []
+        # Explicit-member facts keyed by full (axis, member QName) pair-set.
+        # Typed-member facts keyed by (axis, child text value) pair-set.
+        explicit_groups: dict[frozenset[tuple[str, str]], list] = {}
+        typed_groups: dict[frozenset[tuple[str, str]], list] = {}
 
         for f in dim_facts:
             ctx = f.context
             if not ctx.dimension_members:
                 # typedMember context: has_dimensions=True but no explicit members
-                typed_member_facts.append(f)
+                typed_groups.setdefault(ctx.typed_dimensions, []).append(f)
                 continue
-            cm = _class_member_from_dimensions(ctx.dimensions)
-            if cm:
-                class_axis_groups.setdefault(cm, []).append(f)
-            else:
-                opaque_groups.setdefault(ctx.dimension_members, []).append(f)
+            explicit_groups.setdefault(ctx.dimensions, []).append(f)
 
         def _best(facts: list[Fact]) -> Fact:
-            return max(facts, key=lambda f: f.context.instant or datetime.date.min)
+            return max(facts, key=lambda f: f.context.as_of_date or datetime.date.min)
 
-        sec_list: list[tuple[frozenset[str], RegisteredSecurity]] = list(entries)
+        sec_list: list[tuple[frozenset[tuple[str, str]], RegisteredSecurity]] = list(entries)
         appended: list[RegisteredSecurity] = []
-        n_unmatched = 0
-        unmatched_details: list[str] = []
+        n_unmatched_explicit = 0
 
-        # Match class-axis groups.
-        for cm, facts in class_axis_groups.items():
-            bf = _best(facts)
-            matched_idx = None
-            for i, (_members, sec) in enumerate(sec_list):
-                if sec.dimensioned_members == cm:
-                    matched_idx = i
-                    break
-            if matched_idx is None:
-                candidates = [i for i, (members, sec) in enumerate(sec_list) if cm in members]
-                if len(candidates) == 1:
-                    matched_idx = candidates[0]
+        def _write_or_stub(matched_idx: int | None, bf: Fact, dm: str) -> bool:
+            """Write share count to matched row, or append stub.
+
+            Stub, or empty string, is appended to the end of the all_* securities columns.
+            Returns True if stub.
+            """
             if matched_idx is not None:
                 old_members, old_sec = sec_list[matched_idx]
                 sec_list[matched_idx] = (
@@ -258,109 +304,80 @@ class CompanyFactsExtractor:
                     dataclasses.replace(
                         old_sec,
                         shares_outstanding=_fmt(bf.value),
-                        shares_outstanding_as_of=bf.context.instant,
+                        shares_outstanding_as_of=bf.context.as_of_date,
                     ),
                 )
-            else:
-                appended.append(
-                    RegisteredSecurity(
-                        dimensioned_members=cm,
-                        shares_outstanding=_fmt(bf.value),
-                        shares_outstanding_as_of=bf.context.instant,
-                    )
+                return False
+            appended.append(
+                RegisteredSecurity(
+                    dimensioned_members=dm,
+                    shares_outstanding=_fmt(bf.value),
+                    shares_outstanding_as_of=bf.context.as_of_date,
                 )
-                n_unmatched += 1
-                unmatched_details.append(f"{cm}={_fmt(bf.value)}")
+            )
+            return True
 
-        # Match opaque groups (dimensioned, no class-axis member).
-        for member_set, facts in opaque_groups.items():
+        # Match all explicit-member groups by exact pair-set (axis=member) equality.
+        for pair_set, facts in explicit_groups.items():
             bf = _best(facts)
             matched_idx = None
-            for i, (members, _s) in enumerate(sec_list):
-                if members == member_set:
+            for i, (pairs, _s) in enumerate(sec_list):
+                if pairs == pair_set:
                     matched_idx = i
                     break
-            if matched_idx is not None:
-                old_members, old_sec = sec_list[matched_idx]
-                sec_list[matched_idx] = (
-                    old_members,
-                    dataclasses.replace(
-                        old_sec,
-                        shares_outstanding=_fmt(bf.value),
-                        shares_outstanding_as_of=bf.context.instant,
-                    ),
+            dm = _format_dimensions(pair_set)
+            stub = _write_or_stub(matched_idx, bf, dm)
+            if stub:
+                n_unmatched_explicit += 1
+                _logger.info(
+                    "%s: unmatched explicit-member share group (%s)=%s",
+                    accession_number,
+                    dm,
+                    _fmt(bf.value),
                 )
-            else:
-                opaque_cm = "; ".join(sorted(member_set))
-                appended.append(
-                    RegisteredSecurity(
-                        dimensioned_members=opaque_cm,
-                        shares_outstanding=_fmt(bf.value),
-                        shares_outstanding_as_of=bf.context.instant,
-                    )
-                )
-                n_unmatched += 1
-                unmatched_details.append(f"opaque({opaque_cm})={_fmt(bf.value)}")
 
-        # Typed-member-only contexts: append with axis QName(s) as dimensioned_members.
-        if typed_member_facts:
-            bf = _best(typed_member_facts)
-            typed_dm = "; ".join(sorted(bf.context.typed_axes))
+        # Typed-member contexts: group by (axis, child-value) pair-set, one stub per distinct group.
+        n_unmatched_typed = 0
+        for typed_dims, facts in typed_groups.items():
+            bf = _best(facts)
+            typed_dm = _format_dimensions(typed_dims)
             appended.append(
                 RegisteredSecurity(
                     dimensioned_members=typed_dm,
                     shares_outstanding=_fmt(bf.value),
-                    shares_outstanding_as_of=bf.context.instant,
+                    shares_outstanding_as_of=bf.context.as_of_date,
                 )
             )
+            n_unmatched_typed += 1
             _logger.info(
-                "%s: typed-member-only share count %s; cannot attribute to a security",
+                "%s: unmatched typed-member share group (%s)=%s; cannot attribute to a security",
                 accession_number,
+                typed_dm,
                 _fmt(bf.value),
             )
 
-        if n_unmatched > 0:
-            _logger.info(
-                "%s: %d unjoined share class(es): %s",
-                accession_number,
-                n_unmatched,
-                "; ".join(unmatched_details),
-            )
-
-        # Optional: warn when scalar and summed dimensioned counts diverge.
-        if scalar is not None:
-            joined_sum = sum(
-                Decimal(s.shares_outstanding) for _, s in sec_list if s.shares_outstanding
-            )
-            if joined_sum > 0 and joined_sum != scalar:
-                _logger.info(
-                    "%s: scalar shares (%s) != sum of dimensioned counts (%s)",
-                    accession_number,
-                    scalar,
-                    joined_sum,
-                )
-
-        return [sec for _, sec in sec_list] + appended
+        return [sec for _, sec in sec_list] + appended, n_unmatched_explicit, n_unmatched_typed
 
     def _registered_securities(
         self, doc: InlineXbrlDocument
-    ) -> list[tuple[frozenset[str], RegisteredSecurity]]:
+    ) -> list[tuple[frozenset[tuple[str, str]], RegisteredSecurity]]:
         """Collect every registered security tagged on the cover page.
 
-        Returns (dimension_members, security) tuples in extraction order:
+        Returns (dimensions, security) tuples in extraction order:
         dimensionless groups first, then dimensioned groups in first-seen
-        document order.  The dimension_members set is used by
-        :meth:`_attribute_shares` for member-set-containment matching.
+        document order.  The dimensions frozenset carries full (axis, member)
+        pairs and is used by :meth:`_attribute_shares` for exact-pair and
+        containment matching.
         """
-        dim_groups: dict[frozenset[str], dict[str, str]] = {}
-        dim_dimensions: dict[frozenset[str], frozenset[tuple[str, str]]] = {}
+        # Key dimensioned groups on the full (axis, member) pair-set so that
+        # the same member QName under different axes is treated as distinct.
+        dim_groups: dict[frozenset[tuple[str, str]], dict[str, str]] = {}
         dimless_groups: dict[str, dict[str, str]] = {}
         for concept in _SECURITY_CONCEPTS:
             for f in doc.facts(concept):
                 ctx = f.context
                 if ctx.has_dimensions:
-                    slot = dim_groups.setdefault(ctx.dimension_members, {})
-                    dim_dimensions.setdefault(ctx.dimension_members, ctx.dimensions)
+                    slot = dim_groups.setdefault(ctx.dimensions, {})
                 else:
                     slot = dimless_groups.setdefault(ctx.context_id, {})
                 slot.setdefault(concept, str(f.value))
@@ -379,7 +396,7 @@ class CompanyFactsExtractor:
                         merged.setdefault(concept, value)
                 dimless_groups = {"|".join(sorted(dimless_groups)): merged}
 
-        entries: list[tuple[frozenset[str], RegisteredSecurity]] = []
+        entries: list[tuple[frozenset[tuple[str, str]], RegisteredSecurity]] = []
 
         # Dimensionless first.
         for slot in dimless_groups.values():
@@ -388,11 +405,10 @@ class CompanyFactsExtractor:
                 entries.append((frozenset(), sec))
 
         # Dimensioned second, in first-seen document order.
-        for members, slot in dim_groups.items():
-            dimensions = dim_dimensions.get(members, frozenset())
+        for dimensions, slot in dim_groups.items():
             sec = self._build_security(slot, dimensions)
             if sec is not None:
-                entries.append((members, sec))
+                entries.append((dimensions, sec))
 
         return self._dedupe_securities(entries)
 
@@ -416,7 +432,7 @@ class CompanyFactsExtractor:
         name = " ".join(slot.get(SECURITY_12B_TITLE, "").split())
         if not (ticker or exchange or name):
             return None
-        dim_members = _class_member_from_dimensions(dimensions)
+        dim_members = _format_dimensions(dimensions)
         return RegisteredSecurity(
             security_name=name,
             ticker=ticker,
@@ -426,25 +442,29 @@ class CompanyFactsExtractor:
 
     @staticmethod
     def _dedupe_securities(
-        entries: list[tuple[frozenset[str], RegisteredSecurity]],
-    ) -> list[tuple[frozenset[str], RegisteredSecurity]]:
+        entries: list[tuple[frozenset[tuple[str, str]], RegisteredSecurity]],
+    ) -> list[tuple[frozenset[tuple[str, str]], RegisteredSecurity]]:
         """Collapse entries describing the same security.
 
-        Keyed by (ticker, members) for ticker-bearing securities, or
-        (name, exchange) for ticker-less ones.  When duplicates collide each
-        field takes the first non-empty value; dimensioned_members likewise.
+        Keyed by (ticker, dimensions) for ticker-bearing securities, or
+        (name, exchange, dimensions) for ticker-less ones.  Including the full
+        dimension pair-set in the ticker-less key ensures two distinct classes
+        that share the same name+exchange (e.g. different class-axis members,
+        no ticker) are kept as separate rows rather than collapsed.
+
+        When duplicates do collide each field takes the first non-empty value.
         """
-        by_key: dict[tuple, tuple[frozenset[str], RegisteredSecurity]] = {}
-        for members, sec in entries:
+        by_key: dict[tuple, tuple[frozenset[tuple[str, str]], RegisteredSecurity]] = {}
+        for dimensions, sec in entries:
             if sec.ticker:
-                key: tuple = ("ticker", sec.ticker.lower(), members)
+                key: tuple = ("ticker", sec.ticker.lower(), dimensions)
             else:
-                key = (sec.security_name.lower(), sec.exchange.lower())
+                key = (sec.security_name.lower(), sec.exchange.lower(), dimensions)
             existing = by_key.get(key)
             if existing is None:
-                by_key[key] = (members, sec)
+                by_key[key] = (dimensions, sec)
                 continue
-            ex_members, ex_sec = existing
+            ex_dims, ex_sec = existing
             merged_sec = dataclasses.replace(
                 ex_sec,
                 security_name=ex_sec.security_name or sec.security_name,
@@ -452,7 +472,7 @@ class CompanyFactsExtractor:
                 exchange=ex_sec.exchange or sec.exchange,
                 dimensioned_members=ex_sec.dimensioned_members or sec.dimensioned_members,
             )
-            by_key[key] = (ex_members | members, merged_sec)
+            by_key[key] = (ex_dims | dimensions, merged_sec)
         return list(by_key.values())
 
     def _shell_company(self, doc: InlineXbrlDocument) -> bool | None:

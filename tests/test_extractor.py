@@ -125,9 +125,7 @@ class TestExtract:
         fixture_doc: InlineXbrlDocument,
         sample_filing: Filing,
     ) -> None:
-        records, _ = extractor.extract(sample_filing, fixture_doc)
-        assert len(records) == 1
-        record = records[0]
+        record, _, *_ = extractor.extract(sample_filing, fixture_doc)
         assert record.company_cik == "0000320193"
         assert record.company_name == "APPLE INC"
         assert record.report_date == datetime.date(2024, 9, 28)
@@ -150,8 +148,8 @@ class TestExtract:
                 facts='<p><ix:nonFraction name="dei:EntityPublicFloat" contextRef="c-instant" unitRef="USD" decimals="0">1</ix:nonFraction></p>',
             )
         )
-        records, _ = extractor.extract(sample_filing, doc)
-        assert records[0].company_name == sample_filing.company_name
+        record, _, *_ = extractor.extract(sample_filing, doc)
+        assert record.company_name == sample_filing.company_name
 
 
 # ── TestRevenue ───────────────────────────────────────────────────────────────
@@ -265,7 +263,7 @@ class TestSharesAndSecurities:
         doc = InlineXbrlDocument(
             make_ixbrl_bytes(contexts=_INSTANT_CTX, units=_SHARES_UNIT, facts=facts)
         )
-        shares, date_, securities = extractor._shares_and_securities(doc)
+        shares, date_, securities, *_ = extractor._shares_and_securities(doc)
         assert shares == Decimal("1000000")
         assert date_ == datetime.date(2024, 9, 28)
         assert len(securities) == 1
@@ -284,7 +282,7 @@ class TestSharesAndSecurities:
                 facts='<p><ix:nonFraction name="dei:EntityCommonStockSharesOutstanding" contextRef="c-instant" unitRef="shares" decimals="0">500000</ix:nonFraction></p>',
             )
         )
-        shares, _, securities = extractor._shares_and_securities(doc)
+        shares, _, securities, *_ = extractor._shares_and_securities(doc)
         assert shares == Decimal("500000")
         assert securities == []
 
@@ -300,14 +298,14 @@ class TestSharesAndSecurities:
         doc = InlineXbrlDocument(
             make_ixbrl_bytes(contexts=_CLASS_A_CTX + _CLASS_B_CTX, units=_SHARES_UNIT, facts=facts)
         )
-        shares, date_, securities = extractor._shares_and_securities(doc)
+        shares, date_, securities, *_ = extractor._shares_and_securities(doc)
         assert shares is None
         assert date_ is None
         # Both counts are unmatched (no 12b securities) → two appended rows.
         assert len(securities) == 2
         dim_members = {s.dimensioned_members for s in securities}
-        assert "us-gaap:CommonClassAMember" in dim_members
-        assert "us-gaap:CommonClassBMember" in dim_members
+        assert "us-gaap:StatementClassOfStockAxis=us-gaap:CommonClassAMember" in dim_members
+        assert "us-gaap:StatementClassOfStockAxis=us-gaap:CommonClassBMember" in dim_members
         for s in securities:
             assert s.shares_outstanding != ""
 
@@ -321,7 +319,7 @@ class TestSharesAndSecurities:
         doc = InlineXbrlDocument(
             make_ixbrl_bytes(contexts=_INSTANT_CTX + _DURATION_CTX, units=_SHARES_UNIT, facts=facts)
         )
-        _, _, securities = extractor._shares_and_securities(doc)
+        _, _, securities, *_ = extractor._shares_and_securities(doc)
         assert len(securities) == 1
         assert securities[0].security_name == "Common Stock"
         assert securities[0].ticker == "SONO"
@@ -369,14 +367,17 @@ class TestSharesAndSecurities:
                 facts=facts,
             )
         )
-        shares, _, securities = extractor._shares_and_securities(doc)
+        shares, _, securities, *_ = extractor._shares_and_securities(doc)
         # Dimensioned-only fact → scalar is None.
         assert shares is None
         assert len(securities) == 1
         assert securities[0].ticker == "ADTA"
         assert securities[0].exchange == "NYSE"
         assert securities[0].security_name == "Class A Common Stock"
-        assert securities[0].dimensioned_members == "us-gaap:CommonClassAMember"
+        assert (
+            securities[0].dimensioned_members
+            == "us-gaap:StatementClassOfStockAxis=us-gaap:CommonClassAMember"
+        )
         # Shares attributed to the matched security.
         assert securities[0].shares_outstanding == "1000000"
         assert securities[0].shares_outstanding_as_of == datetime.date(2024, 9, 28)
@@ -389,7 +390,7 @@ class TestSharesAndSecurities:
         doc = InlineXbrlDocument(
             make_ixbrl_bytes(contexts=_INSTANT_CTX, units=_SHARES_UNIT, facts=facts)
         )
-        _, _, securities = extractor._shares_and_securities(doc)
+        _, _, securities, *_ = extractor._shares_and_securities(doc)
         assert securities == []
 
     def test_no_shares_returns_none(self, extractor: CompanyFactsExtractor) -> None:
@@ -399,7 +400,7 @@ class TestSharesAndSecurities:
                 facts='<p><ix:nonNumeric name="dei:EntityRegistrantName" contextRef="c-duration">ACME</ix:nonNumeric></p>',
             )
         )
-        shares, date_, securities = extractor._shares_and_securities(doc)
+        shares, date_, securities, *_ = extractor._shares_and_securities(doc)
         assert shares is None
         assert date_ is None
         assert securities == []
@@ -419,7 +420,7 @@ class TestSharesAndSecurities:
         doc = InlineXbrlDocument(
             make_ixbrl_bytes(contexts=_INSTANT_CTX + earlier_ctx, units=_SHARES_UNIT, facts=facts)
         )
-        shares, date_, _ = extractor._shares_and_securities(doc)
+        shares, date_, _, *_ = extractor._shares_and_securities(doc)
         assert shares == Decimal("999999")
         assert date_ == datetime.date(2024, 9, 28)
 
@@ -440,7 +441,7 @@ class TestAttributionCases:
         doc = InlineXbrlDocument(
             make_ixbrl_bytes(contexts=_INSTANT_CTX, units=_SHARES_UNIT, facts=facts)
         )
-        shares, _, securities = extractor._shares_and_securities(doc)
+        shares, _, securities, *_ = extractor._shares_and_securities(doc)
         assert shares == Decimal("1000000")
         assert len(securities) == 1
         assert securities[0].shares_outstanding == ""
@@ -492,7 +493,7 @@ class TestAttributionCases:
                 facts=facts,
             )
         )
-        shares, _, securities = extractor._shares_and_securities(doc)
+        shares, _, securities, *_ = extractor._shares_and_securities(doc)
         # No dimensionless count → scalar empty.
         assert shares is None
         # 2 matched + 1 appended.
@@ -502,12 +503,15 @@ class TestAttributionCases:
         appended = next(s for s in securities if not s.ticker)
         assert googl.shares_outstanding == "5000000000"
         assert goog.shares_outstanding == "900000000"
-        assert appended.dimensioned_members == "us-gaap:CommonClassCMember"
+        assert (
+            appended.dimensioned_members
+            == "us-gaap:StatementClassOfStockAxis=us-gaap:CommonClassCMember"
+        )
         assert appended.shares_outstanding == "50000000"
 
     def test_snail_shape(self, extractor: CompanyFactsExtractor) -> None:
         # 1 dimensionless security (ticker SNAL); 2 dimensioned counts with no
-        # matching security → 2 appended rows; scalar EMPTY; unjoined logged.
+        # matching security → 2 appended rows; scalar EMPTY; unmatched logged.
         facts = (
             '<p><ix:nonNumeric name="dei:TradingSymbol" contextRef="c-instant">SNAL</ix:nonNumeric></p>'
             '<p><ix:nonNumeric name="dei:SecurityExchangeName" contextRef="c-instant">NYSE</ix:nonNumeric></p>'
@@ -521,7 +525,7 @@ class TestAttributionCases:
                 facts=facts,
             )
         )
-        shares, _, securities = extractor._shares_and_securities(doc)
+        shares, _, securities, *_ = extractor._shares_and_securities(doc)
         assert shares is None
         # Original security has ticker but no shares (dimensionless, no dim match).
         snal = next(s for s in securities if s.ticker == "SNAL")
@@ -562,7 +566,7 @@ class TestAttributionCases:
                 facts=facts,
             )
         )
-        shares, _, securities = extractor._shares_and_securities(doc)
+        shares, _, securities, *_ = extractor._shares_and_securities(doc)
         assert shares == Decimal("5000000")
         assert len(securities) == 2
         for s in securities:
@@ -601,7 +605,7 @@ class TestAttributionCases:
                 facts=facts,
             )
         )
-        shares, _, securities = extractor._shares_and_securities(doc)
+        shares, _, securities, *_ = extractor._shares_and_securities(doc)
         assert shares == Decimal("6000000")
         assert len(securities) == 2
         cla = next(s for s in securities if s.ticker == "CLA")
@@ -627,7 +631,7 @@ class TestAttributionCases:
                 facts=_ORDINARY_FACTS + _ADS_FACTS + notes_facts,
             )
         )
-        shares, _, securities = extractor._shares_and_securities(doc)
+        shares, _, securities, *_ = extractor._shares_and_securities(doc)
         assert shares == Decimal("2000000000")
         # ORD (dimensionless, first), ADSX (dimensional), notes (dimensional).
         assert len(securities) == 3
@@ -685,7 +689,7 @@ class TestAttributionCases:
                 facts=facts,
             )
         )
-        shares, _, securities = extractor._shares_and_securities(doc)
+        shares, _, securities, *_ = extractor._shares_and_securities(doc)
         assert shares is None
         cla = next(s for s in securities if s.ticker == "CLA")
         clb = next(s for s in securities if s.ticker == "CLB")
@@ -720,7 +724,7 @@ class TestAttributionCases:
                 facts=facts,
             )
         )
-        shares, _, securities = extractor._shares_and_securities(doc)
+        shares, _, securities, *_ = extractor._shares_and_securities(doc)
         assert shares is None
         # Opaque count unmatched → appended row with dimensioned_members="us-gaap:SubsidiaryMember".
         appended = [s for s in securities if not s.ticker]
@@ -728,11 +732,9 @@ class TestAttributionCases:
         assert appended[0].shares_outstanding == "99999"
         assert "SubsidiaryMember" in appended[0].dimensioned_members
 
-    def test_class_axis_extraction_ignores_other_axes(
-        self, extractor: CompanyFactsExtractor
-    ) -> None:
+    def test_multi_axis_security_stores_all_pairs(self, extractor: CompanyFactsExtractor) -> None:
         # Context has class-axis member + second unrelated axis member.
-        # dimensioned_members should only capture the StatementClassOfStockAxis member.
+        # dimensioned_members stores all axis=member pairs, sorted by axis name.
         ctx_two_axes = """
         <xbrli:context id="c-two-axes">
           <xbrli:entity>
@@ -749,21 +751,25 @@ class TestAttributionCases:
         </xbrli:context>"""
         facts = '<p><ix:nonNumeric name="dei:TradingSymbol" contextRef="c-two-axes">CLA</ix:nonNumeric></p>'
         doc = InlineXbrlDocument(make_ixbrl_bytes(contexts=ctx_two_axes, facts=facts))
-        _, _, securities = extractor._shares_and_securities(doc)
+        _, _, securities, *_ = extractor._shares_and_securities(doc)
         assert len(securities) == 1
-        assert securities[0].dimensioned_members == "us-gaap:CommonClassAMember"
+        # Both axes stored; LegalEntityAxis sorts before StatementClassOfStockAxis.
+        assert securities[0].dimensioned_members == (
+            "us-gaap:LegalEntityAxis=us-gaap:ParentMember"
+            "; us-gaap:StatementClassOfStockAxis=us-gaap:CommonClassAMember"
+        )
 
     def test_typed_member_only_count_appended_with_axis_name(
         self, extractor: CompanyFactsExtractor
     ) -> None:
         # A shares count in a typed-member context cannot be attributed → appended
-        # with dimensioned_members set to the typed axis QName.
+        # with dimensioned_members set to "axis=child_value".
         typed_ctx = """
         <xbrli:context id="c-typed">
           <xbrli:entity>
             <xbrli:identifier scheme="http://www.sec.gov/CIK">0001234567</xbrli:identifier>
             <xbrli:segment>
-              <xbrli:typedMember dimension="us-gaap:Axis"><us-gaap:Val>1</us-gaap:Val></xbrli:typedMember>
+              <xbrldi:typedMember dimension="us-gaap:Axis"><us-gaap:Val>1</us-gaap:Val></xbrldi:typedMember>
             </xbrli:segment>
           </xbrli:entity>
           <xbrli:period><xbrli:instant>2024-09-28</xbrli:instant></xbrli:period>
@@ -775,11 +781,11 @@ class TestAttributionCases:
         doc = InlineXbrlDocument(
             make_ixbrl_bytes(contexts=_INSTANT_CTX + typed_ctx, units=_SHARES_UNIT, facts=facts)
         )
-        shares, _, securities = extractor._shares_and_securities(doc)
+        shares, _, securities, *_ = extractor._shares_and_securities(doc)
         assert shares is None
         appended = [s for s in securities if not s.ticker]
         assert len(appended) == 1
-        assert appended[0].dimensioned_members == "us-gaap:Axis"
+        assert appended[0].dimensioned_members == "us-gaap:Axis=1"
         assert appended[0].shares_outstanding == "55555"
 
     def test_opaque_non_class_axis_count_appended_sorted_members(
@@ -804,7 +810,7 @@ class TestAttributionCases:
         doc = InlineXbrlDocument(
             make_ixbrl_bytes(contexts=_INSTANT_CTX + opaque_ctx, units=_SHARES_UNIT, facts=facts)
         )
-        shares, _, securities = extractor._shares_and_securities(doc)
+        shares, _, securities, *_ = extractor._shares_and_securities(doc)
         assert shares is None
         appended = [s for s in securities if not s.ticker]
         assert len(appended) == 1
@@ -839,7 +845,7 @@ class TestAttributionCases:
                 facts=facts,
             )
         )
-        _, _, securities = extractor._shares_and_securities(doc)
+        _, _, securities, *_ = extractor._shares_and_securities(doc)
         # All per-security attributes must have equal count.
         fields = [
             [s.security_name for s in securities],
@@ -869,7 +875,7 @@ class TestRegisteredSecurities:
 
     def test_dimensionless_before_dimensioned(self, extractor: CompanyFactsExtractor) -> None:
         # Dimensionless ORD comes before dimensional ADSX in extraction order.
-        shares, _, securities = extractor._shares_and_securities(self._ads_doc())
+        shares, _, securities, *_ = extractor._shares_and_securities(self._ads_doc())
         assert shares == Decimal(2000000000)
         assert len(securities) == 2
         assert securities[0].ticker == "ORD"
@@ -877,7 +883,10 @@ class TestRegisteredSecurities:
         assert securities[0].dimensioned_members == ""  # dimensionless
         assert securities[1].ticker == "ADSX"
         assert securities[1].exchange == "NYSE"
-        assert securities[1].dimensioned_members == "us-gaap:AmericanDepositarySharesMember"
+        assert (
+            securities[1].dimensioned_members
+            == "us-gaap:StatementClassOfStockAxis=us-gaap:AmericanDepositarySharesMember"
+        )
 
     def test_document_order_for_dimensioned(self, extractor: CompanyFactsExtractor) -> None:
         # Two dimensioned securities; document order (first seen) determines order.
@@ -921,7 +930,7 @@ class TestRegisteredSecurities:
                 facts=facts,
             )
         )
-        _, _, securities = extractor._shares_and_securities(doc)
+        _, _, securities, *_ = extractor._shares_and_securities(doc)
         # Class A DEI facts appear first in document → Class A is first.
         assert [s.ticker for s in securities] == ["DUAL.A", "DUAL.B"]
         # Class B gets its share count attributed via dimensioned_members match.
@@ -946,7 +955,7 @@ class TestRegisteredSecurities:
                 facts=_ORDINARY_FACTS + _ADS_FACTS + notes_facts,
             )
         )
-        _, _, securities = extractor._shares_and_securities(doc)
+        _, _, securities, *_ = extractor._shares_and_securities(doc)
         # ORD (dimensionless), ADSX (first dimensional), notes (second dimensional).
         assert securities[0].ticker == "ORD"
         assert securities[1].ticker == "ADSX"
@@ -968,7 +977,7 @@ class TestRegisteredSecurities:
                 facts=dup_facts,
             )
         )
-        _, _, securities = extractor._shares_and_securities(doc)
+        _, _, securities, *_ = extractor._shares_and_securities(doc)
         assert len(securities) == 2
         tickers = {s.ticker for s in securities}
         assert tickers == {"AAPL"}
@@ -1003,18 +1012,18 @@ class TestRegisteredSecurities:
                 facts=facts,
             )
         )
-        _, _, securities = extractor._shares_and_securities(doc)
+        _, _, securities, *_ = extractor._shares_and_securities(doc)
         assert len(securities) == 2
         members = {s.dimensioned_members for s in securities}
-        assert "us-gaap:OrdinarySharesMember" in members
-        assert "us-gaap:AmericanDepositarySharesMember" in members
+        assert "us-gaap:StatementClassOfStockAxis=us-gaap:OrdinarySharesMember" in members
+        assert "us-gaap:StatementClassOfStockAxis=us-gaap:AmericanDepositarySharesMember" in members
 
     def test_extract_multiple_securities_does_not_fail(
         self, extractor: CompanyFactsExtractor, sample_filing: Filing
     ) -> None:
-        records, failures = extractor.extract(sample_filing, self._ads_doc())
+        record, failures, *_ = extractor.extract(sample_filing, self._ads_doc())
         assert not any("multiple" in str(f).lower() for f in failures)
-        record = records[0]
+        record = record
         # Dimensionless ORD is first; ADSX follows.
         primary = record.registered_securities[0]
         assert primary.ticker == "ORD"
@@ -1028,9 +1037,9 @@ class TestRegisteredSecurities:
         fixture_doc: InlineXbrlDocument,
         sample_filing: Filing,
     ) -> None:
-        records, _ = extractor.extract(sample_filing, fixture_doc)
-        assert len(records[0].registered_securities) == 1
-        assert records[0].registered_securities[0].ticker == "AAPL"
+        record, _, *_ = extractor.extract(sample_filing, fixture_doc)
+        assert len(record.registered_securities) == 1
+        assert record.registered_securities[0].ticker == "AAPL"
 
     def test_dimensioned_shares_in_ads_context_attributed_to_ads(
         self, extractor: CompanyFactsExtractor
@@ -1062,9 +1071,9 @@ class TestRegisteredSecurities:
                 facts=facts,
             )
         )
-        _, shares_date, securities = extractor._shares_and_securities(doc)
+        _, shares_date, securities, *_ = extractor._shares_and_securities(doc)
         # No dimensionless shares fact → scalar is None.
-        shares, _, securities = extractor._shares_and_securities(doc)
+        shares, _, securities, *_ = extractor._shares_and_securities(doc)
         assert shares is None
         # ORD (dimensionless) appears first.
         assert securities[0].ticker == "ORD"
@@ -1090,12 +1099,12 @@ class TestRegisteredSecurities:
                 facts=mixed_facts,
             )
         )
-        _, _, securities = extractor._shares_and_securities(doc)
+        _, _, securities, *_ = extractor._shares_and_securities(doc)
         assert len(securities) == 2
-        # Dimensionless entry has empty dimensioned_members; dimensional has ADS member.
+        # Dimensionless entry has empty dimensioned_members; dimensional has ADS member with axis.
         members = {s.dimensioned_members for s in securities}
         assert "" in members
-        assert "us-gaap:AmericanDepositarySharesMember" in members
+        assert "us-gaap:StatementClassOfStockAxis=us-gaap:AmericanDepositarySharesMember" in members
 
 
 # ── TestShellCompany ──────────────────────────────────────────────────────────
@@ -1155,8 +1164,8 @@ class TestExtractionFailures:
                 facts='<p><ix:nonFraction name="dei:EntityPublicFloat" contextRef="c-instant" unitRef="USD" decimals="0">1</ix:nonFraction></p>',
             )
         )
-        records, failures = extractor.extract(sample_filing, doc)
-        assert len(records) == 1
+        record, failures, *_ = extractor.extract(sample_filing, doc)
+
         assert FailureType.MISSING_PERIOD_END in failures
         assert FailureType.NO_REVENUE_CONCEPT not in failures
 
@@ -1169,8 +1178,8 @@ class TestExtractionFailures:
                 facts='<ix:nonNumeric name="dei:DocumentPeriodEndDate" contextRef="c-duration" format="ixt:date-monthname-day-year-en">September 28, 2024</ix:nonNumeric>',
             )
         )
-        records, failures = extractor.extract(sample_filing, doc)
-        assert len(records) == 1
+        record, failures, *_ = extractor.extract(sample_filing, doc)
+
         assert FailureType.NO_REVENUE_CONCEPT in failures
         assert FailureType.MISSING_PERIOD_END not in failures
 
@@ -1185,9 +1194,9 @@ class TestExtractionFailures:
         doc = InlineXbrlDocument(
             make_ixbrl_bytes(contexts=_DURATION_CTX, units=_USD_UNIT, facts=facts)
         )
-        records, failures = extractor.extract(sample_filing, doc)
+        record, failures, *_ = extractor.extract(sample_filing, doc)
         assert FailureType.AMBIGUOUS_REVENUE in failures
-        assert Decimal(records[0].revenue) == Decimal("200")
+        assert Decimal(record.revenue) == Decimal("200")
 
     def test_equal_revenue_values_across_concepts_not_ambiguous(
         self, extractor: CompanyFactsExtractor, sample_filing: Filing
@@ -1200,7 +1209,7 @@ class TestExtractionFailures:
         doc = InlineXbrlDocument(
             make_ixbrl_bytes(contexts=_DURATION_CTX, units=_USD_UNIT, facts=facts)
         )
-        _, failures = extractor.extract(sample_filing, doc)
+        _, failures, *_ = extractor.extract(sample_filing, doc)
         assert FailureType.AMBIGUOUS_REVENUE not in failures
 
 
@@ -1257,12 +1266,12 @@ class TestExtract20F:
                 facts=facts,
             )
         )
-        records, failures = extractor.extract(filing_20f, doc)
-        assert len(records) == 1
-        assert records[0].revenue == "2500000000"
-        assert records[0].revenue_currency == "EUR"
-        assert records[0].report_date == datetime.date(2024, 12, 31)
-        assert records[0].form_type == "20-F"
+        record, failures, *_ = extractor.extract(filing_20f, doc)
+
+        assert record.revenue == "2500000000"
+        assert record.revenue_currency == "EUR"
+        assert record.report_date == datetime.date(2024, 12, 31)
+        assert record.form_type == "20-F"
         assert FailureType.NO_REVENUE_CONCEPT not in failures
 
     def test_extracts_ifrs15_revenue_concept(
@@ -1283,9 +1292,9 @@ class TestExtract20F:
                 facts=facts,
             )
         )
-        records, failures = extractor.extract(filing_20f, doc)
-        assert len(records) == 1
-        assert Decimal(records[0].revenue) == Decimal("3000000000")
+        record, failures, *_ = extractor.extract(filing_20f, doc)
+
+        assert Decimal(record.revenue) == Decimal("3000000000")
         assert FailureType.AMBIGUOUS_REVENUE in failures
 
     def test_non_standard_ifrs_prefix_normalized(
@@ -1305,9 +1314,9 @@ class TestExtract20F:
                 ifrs_prefix="ifrs",
             )
         )
-        records, failures = extractor.extract(filing_20f, doc)
-        assert len(records) == 1
-        assert records[0].revenue == "1800000000"
+        record, failures, *_ = extractor.extract(filing_20f, doc)
+
+        assert record.revenue == "1800000000"
         assert FailureType.NO_REVENUE_CONCEPT not in failures
 
     def test_period_end_text_date_no_format_attribute(
@@ -1327,9 +1336,9 @@ class TestExtract20F:
                 facts=facts,
             )
         )
-        records, failures = extractor.extract(filing_20f, doc)
-        assert records[0].report_date == datetime.date(2024, 12, 31)
-        assert records[0].revenue == "500000000"
+        record, failures, *_ = extractor.extract(filing_20f, doc)
+        assert record.report_date == datetime.date(2024, 12, 31)
+        assert record.revenue == "500000000"
         assert FailureType.MISSING_PERIOD_END not in failures
         assert FailureType.NO_REVENUE_CONCEPT not in failures
 
@@ -1350,9 +1359,9 @@ class TestExtract20F:
                 facts=facts,
             )
         )
-        records, failures = extractor.extract(filing_20f, doc)
-        assert records[0].report_date == datetime.date(2024, 12, 31)
-        assert records[0].revenue == "300000000"
+        record, failures, *_ = extractor.extract(filing_20f, doc)
+        assert record.report_date == datetime.date(2024, 12, 31)
+        assert record.revenue == "300000000"
         assert FailureType.MISSING_PERIOD_END not in failures
 
     def test_revenue_including_assessed_tax(
@@ -1371,9 +1380,9 @@ class TestExtract20F:
                 facts=facts,
             )
         )
-        records, failures = extractor.extract(filing_20f, doc)
-        assert records[0].revenue == "74569867"
-        assert records[0].revenue_currency == "USD"
+        record, failures, *_ = extractor.extract(filing_20f, doc)
+        assert record.revenue == "74569867"
+        assert record.revenue_currency == "USD"
         assert FailureType.NO_REVENUE_CONCEPT not in failures
 
     def test_20f_no_counts_all_slots_empty(
@@ -1395,9 +1404,383 @@ class TestExtract20F:
                 facts=facts,
             )
         )
-        records, _ = extractor.extract(filing_20f, doc)
-        record = records[0]
+        record, _, *_ = extractor.extract(filing_20f, doc)
+        record = record
         assert record.shares_outstanding == ""
         assert record.shares_outstanding_as_of_date is None
         for s in record.registered_securities:
             assert s.shares_outstanding == ""
+
+
+# ── TestA1DedupeAndNoOverwrite ─────────────────────────────────────────────────
+
+
+class TestA1DedupeAndNoOverwrite:
+    """A1: ticker-less dedup must include dimensions; no-overwrite rule in attribution."""
+
+    def test_two_tickerless_same_name_exchange_different_class_members_stay_separate(
+        self, extractor: CompanyFactsExtractor
+    ) -> None:
+        # Two classes with same security name and exchange but different class-axis members
+        # and no ticker — must remain two distinct rows.
+        ctx_a = """
+        <xbrli:context id="c-class-a-dei">
+          <xbrli:entity>
+            <xbrli:identifier scheme="http://www.sec.gov/CIK">0001234567</xbrli:identifier>
+            <xbrli:segment>
+              <xbrldi:explicitMember dimension="us-gaap:StatementClassOfStockAxis">us-gaap:CommonClassAMember</xbrldi:explicitMember>
+            </xbrli:segment>
+          </xbrli:entity>
+          <xbrli:period><xbrli:instant>2024-09-28</xbrli:instant></xbrli:period>
+        </xbrli:context>"""
+        ctx_b = ctx_a.replace("c-class-a-dei", "c-class-b-dei").replace(
+            "CommonClassAMember", "CommonClassBMember"
+        )
+        ctx_a_shares = ctx_a.replace("c-class-a-dei", "c-class-a-sh")
+        ctx_b_shares = ctx_b.replace("c-class-b-dei", "c-class-b-sh")
+        facts = (
+            '<p><ix:nonNumeric name="dei:Security12bTitle" contextRef="c-class-a-dei">Common Stock</ix:nonNumeric></p>'
+            '<p><ix:nonNumeric name="dei:SecurityExchangeName" contextRef="c-class-a-dei">NYSE</ix:nonNumeric></p>'
+            '<p><ix:nonNumeric name="dei:Security12bTitle" contextRef="c-class-b-dei">Common Stock</ix:nonNumeric></p>'
+            '<p><ix:nonNumeric name="dei:SecurityExchangeName" contextRef="c-class-b-dei">NYSE</ix:nonNumeric></p>'
+            '<p><ix:nonFraction name="dei:EntityCommonStockSharesOutstanding" contextRef="c-class-a-sh" unitRef="shares" decimals="0">111</ix:nonFraction></p>'
+            '<p><ix:nonFraction name="dei:EntityCommonStockSharesOutstanding" contextRef="c-class-b-sh" unitRef="shares" decimals="0">222</ix:nonFraction></p>'
+        )
+        doc = InlineXbrlDocument(
+            make_ixbrl_bytes(
+                contexts=ctx_a + ctx_b + ctx_a_shares + ctx_b_shares,
+                units=_SHARES_UNIT,
+                facts=facts,
+            )
+        )
+        _, _, securities, *_ = extractor._shares_and_securities(doc)
+        assert len(securities) == 2
+        counts = {s.shares_outstanding for s in securities}
+        assert "111" in counts
+        assert "222" in counts
+
+    def test_nonclass_axis_security_matched_by_exact_pair_set(
+        self, extractor: CompanyFactsExtractor
+    ) -> None:
+        # A security registered under a non-class axis is matched when a share count
+        # has the identical full (axis, member) pair-set — not by bare member value.
+        # A class-axis share count with the same member QName does NOT match.
+        legal_axis_ctx = """
+        <xbrli:context id="c-legal-sec">
+          <xbrli:entity>
+            <xbrli:identifier scheme="http://www.sec.gov/CIK">0001234567</xbrli:identifier>
+            <xbrli:segment>
+              <xbrldi:explicitMember dimension="us-gaap:LegalEntityAxis">us-gaap:CommonClassAMember</xbrldi:explicitMember>
+            </xbrli:segment>
+          </xbrli:entity>
+          <xbrli:period><xbrli:instant>2024-09-28</xbrli:instant></xbrli:period>
+        </xbrli:context>"""
+        # Share count using the same axis=member pair as the security.
+        legal_shares_ctx = legal_axis_ctx.replace("c-legal-sec", "c-legal-shares")
+        # A second share count on the standard class-of-stock axis (same member QName).
+        class_axis_ctx = legal_axis_ctx.replace("c-legal-sec", "c-class-shares").replace(
+            "LegalEntityAxis", "StatementClassOfStockAxis"
+        )
+        facts = (
+            '<p><ix:nonNumeric name="dei:Security12bTitle" contextRef="c-legal-sec">Common Stock</ix:nonNumeric></p>'
+            '<p><ix:nonNumeric name="dei:SecurityExchangeName" contextRef="c-legal-sec">NYSE</ix:nonNumeric></p>'
+            # Matched: same pair-set as registered security.
+            '<p><ix:nonFraction name="dei:EntityCommonStockSharesOutstanding" contextRef="c-legal-shares" unitRef="shares" decimals="0">111</ix:nonFraction></p>'
+            # Unmatched: different axis, even though member QName is the same.
+            '<p><ix:nonFraction name="dei:EntityCommonStockSharesOutstanding" contextRef="c-class-shares" unitRef="shares" decimals="0">222</ix:nonFraction></p>'
+        )
+        doc = InlineXbrlDocument(
+            make_ixbrl_bytes(
+                contexts=legal_axis_ctx + legal_shares_ctx + class_axis_ctx,
+                units=_SHARES_UNIT,
+                facts=facts,
+            )
+        )
+        _, _, securities, *_ = extractor._shares_and_securities(doc)
+        # 1 matched (legal-axis share count), 1 unmatched stub (class-axis share count).
+        assert len(securities) == 2
+        matched = [s for s in securities if s.security_name or s.exchange]
+        stubs = [s for s in securities if not s.security_name and not s.ticker and not s.exchange]
+        assert len(matched) == 1
+        assert matched[0].shares_outstanding == "111"
+        assert len(stubs) == 1
+        assert stubs[0].shares_outstanding == "222"
+
+
+# ── TestA2FullPairKeys ─────────────────────────────────────────────────────────
+
+
+class TestA2FullPairKeys:
+    """A2: same member QName under two different axes must be distinct groups."""
+
+    def test_same_member_different_axes_treated_as_distinct_opaque_groups(
+        self, extractor: CompanyFactsExtractor
+    ) -> None:
+        # Two share-count contexts: same member QName "MemberM" but under different axes.
+        # With bare-member keying they collapse; with full-pair keying they stay separate.
+        ctx_x = """
+        <xbrli:context id="c-axis-x">
+          <xbrli:entity>
+            <xbrli:identifier scheme="http://www.sec.gov/CIK">0001234567</xbrli:identifier>
+            <xbrli:segment>
+              <xbrldi:explicitMember dimension="us-gaap:AxisX">us-gaap:MemberM</xbrldi:explicitMember>
+            </xbrli:segment>
+          </xbrli:entity>
+          <xbrli:period><xbrli:instant>2024-09-28</xbrli:instant></xbrli:period>
+        </xbrli:context>"""
+        ctx_y = ctx_x.replace("c-axis-x", "c-axis-y").replace("AxisX", "AxisY")
+        facts = (
+            '<p><ix:nonFraction name="dei:EntityCommonStockSharesOutstanding" contextRef="c-axis-x" unitRef="shares" decimals="0">111</ix:nonFraction></p>'
+            '<p><ix:nonFraction name="dei:EntityCommonStockSharesOutstanding" contextRef="c-axis-y" unitRef="shares" decimals="0">222</ix:nonFraction></p>'
+        )
+        doc = InlineXbrlDocument(
+            make_ixbrl_bytes(contexts=ctx_x + ctx_y, units=_SHARES_UNIT, facts=facts)
+        )
+        _, _, securities, *_ = extractor._shares_and_securities(doc)
+        # Both counts are unmatched (no registered securities); must be two separate stubs.
+        assert len(securities) == 2
+        counts = {s.shares_outstanding for s in securities}
+        assert "111" in counts
+        assert "222" in counts
+
+    def test_same_member_different_axes_registered_securities_kept_separate(
+        self, extractor: CompanyFactsExtractor
+    ) -> None:
+        # Two registered securities: same member QName under different axes.
+        # Must be two rows, not merged.
+        ctx_x = """
+        <xbrli:context id="c-sec-x">
+          <xbrli:entity>
+            <xbrli:identifier scheme="http://www.sec.gov/CIK">0001234567</xbrli:identifier>
+            <xbrli:segment>
+              <xbrldi:explicitMember dimension="us-gaap:AxisX">us-gaap:MemberM</xbrldi:explicitMember>
+            </xbrli:segment>
+          </xbrli:entity>
+          <xbrli:period><xbrli:instant>2024-09-28</xbrli:instant></xbrli:period>
+        </xbrli:context>"""
+        ctx_y = ctx_x.replace("c-sec-x", "c-sec-y").replace("AxisX", "AxisY")
+        facts = (
+            '<p><ix:nonNumeric name="dei:Security12bTitle" contextRef="c-sec-x">Class X Security</ix:nonNumeric></p>'
+            '<p><ix:nonNumeric name="dei:Security12bTitle" contextRef="c-sec-y">Class Y Security</ix:nonNumeric></p>'
+        )
+        doc = InlineXbrlDocument(make_ixbrl_bytes(contexts=ctx_x + ctx_y, facts=facts))
+        _, _, securities, *_ = extractor._shares_and_securities(doc)
+        assert len(securities) == 2
+        names = {s.security_name for s in securities}
+        assert "Class X Security" in names
+        assert "Class Y Security" in names
+
+
+# ── TestA3ContainmentFallback ──────────────────────────────────────────────────
+
+
+class TestA3NonClassAxisMatching:
+    """A3: non-class-axis securities match only by exact (axis, member) pair-set."""
+
+    def test_security_and_share_count_same_nonclass_axis_matched(
+        self, extractor: CompanyFactsExtractor
+    ) -> None:
+        # Security registered under LegalEntityAxis/SubsidiaryMember.
+        # Share count also on LegalEntityAxis/SubsidiaryMember → exact pair-set match.
+        ctx = """
+        <xbrli:context id="c-legal">
+          <xbrli:entity>
+            <xbrli:identifier scheme="http://www.sec.gov/CIK">0001234567</xbrli:identifier>
+            <xbrli:segment>
+              <xbrldi:explicitMember dimension="us-gaap:LegalEntityAxis">us-gaap:SubsidiaryMember</xbrldi:explicitMember>
+            </xbrli:segment>
+          </xbrli:entity>
+          <xbrli:period>
+            <xbrli:startDate>2023-09-30</xbrli:startDate>
+            <xbrli:endDate>2024-09-28</xbrli:endDate>
+          </xbrli:period>
+        </xbrli:context>"""
+        shares_ctx = """
+        <xbrli:context id="c-legal-shares">
+          <xbrli:entity>
+            <xbrli:identifier scheme="http://www.sec.gov/CIK">0001234567</xbrli:identifier>
+            <xbrli:segment>
+              <xbrldi:explicitMember dimension="us-gaap:LegalEntityAxis">us-gaap:SubsidiaryMember</xbrldi:explicitMember>
+            </xbrli:segment>
+          </xbrli:entity>
+          <xbrli:period><xbrli:instant>2024-09-28</xbrli:instant></xbrli:period>
+        </xbrli:context>"""
+        facts = (
+            '<p><ix:nonNumeric name="dei:TradingSymbol" contextRef="c-legal">SUB</ix:nonNumeric></p>'
+            '<p><ix:nonNumeric name="dei:SecurityExchangeName" contextRef="c-legal">NYSE</ix:nonNumeric></p>'
+            '<p><ix:nonFraction name="dei:EntityCommonStockSharesOutstanding" contextRef="c-legal-shares" unitRef="shares" decimals="0">77777</ix:nonFraction></p>'
+        )
+        doc = InlineXbrlDocument(
+            make_ixbrl_bytes(contexts=ctx + shares_ctx, units=_SHARES_UNIT, facts=facts)
+        )
+        _, _, securities, *_ = extractor._shares_and_securities(doc, "test-accession")
+
+        assert len(securities) == 1
+        assert securities[0].ticker == "SUB"
+        assert securities[0].shares_outstanding == "77777"
+        assert (
+            securities[0].dimensioned_members == "us-gaap:LegalEntityAxis=us-gaap:SubsidiaryMember"
+        )
+
+    def test_security_and_share_count_different_axis_not_matched(
+        self, extractor: CompanyFactsExtractor
+    ) -> None:
+        # Security on LegalEntityAxis/SubsidiaryMember; share count on
+        # StatementClassOfStockAxis/SubsidiaryMember — same member QName, different axis.
+        # Full-pair matching must not cross axis boundaries → no match → stub appended.
+        legal_ctx = """
+        <xbrli:context id="c-legal">
+          <xbrli:entity>
+            <xbrli:identifier scheme="http://www.sec.gov/CIK">0001234567</xbrli:identifier>
+            <xbrli:segment>
+              <xbrldi:explicitMember dimension="us-gaap:LegalEntityAxis">us-gaap:SubsidiaryMember</xbrldi:explicitMember>
+            </xbrli:segment>
+          </xbrli:entity>
+          <xbrli:period>
+            <xbrli:startDate>2023-09-30</xbrli:startDate>
+            <xbrli:endDate>2024-09-28</xbrli:endDate>
+          </xbrli:period>
+        </xbrli:context>"""
+        class_shares_ctx = """
+        <xbrli:context id="c-class-shares">
+          <xbrli:entity>
+            <xbrli:identifier scheme="http://www.sec.gov/CIK">0001234567</xbrli:identifier>
+            <xbrli:segment>
+              <xbrldi:explicitMember dimension="us-gaap:StatementClassOfStockAxis">us-gaap:SubsidiaryMember</xbrldi:explicitMember>
+            </xbrli:segment>
+          </xbrli:entity>
+          <xbrli:period><xbrli:instant>2024-09-28</xbrli:instant></xbrli:period>
+        </xbrli:context>"""
+        facts = (
+            '<p><ix:nonNumeric name="dei:TradingSymbol" contextRef="c-legal">SUB</ix:nonNumeric></p>'
+            '<p><ix:nonNumeric name="dei:SecurityExchangeName" contextRef="c-legal">NYSE</ix:nonNumeric></p>'
+            '<p><ix:nonFraction name="dei:EntityCommonStockSharesOutstanding" contextRef="c-class-shares" unitRef="shares" decimals="0">99999</ix:nonFraction></p>'
+        )
+        doc = InlineXbrlDocument(
+            make_ixbrl_bytes(contexts=legal_ctx + class_shares_ctx, units=_SHARES_UNIT, facts=facts)
+        )
+        _, _, securities, *_ = extractor._shares_and_securities(doc, "test-accession")
+
+        # Registered security (unmatched, no share count) + stub from the class-axis fact.
+        assert len(securities) == 2
+        matched = [s for s in securities if s.ticker == "SUB"]
+        stubs = [s for s in securities if not s.ticker]
+        assert len(matched) == 1
+        assert matched[0].shares_outstanding == ""
+        assert len(stubs) == 1
+        assert stubs[0].shares_outstanding == "99999"
+
+
+# ── TestA7AmbiguousShares ──────────────────────────────────────────────────────
+
+
+class TestA7AmbiguousShares:
+    """A7: two same-instant dimensionless share facts with conflicting values."""
+
+    def test_conflicting_same_instant_dimensionless_facts_flags_ambiguous(
+        self, extractor: CompanyFactsExtractor, sample_filing: Filing
+    ) -> None:
+        facts = (
+            '<p><ix:nonFraction name="dei:EntityCommonStockSharesOutstanding" contextRef="c-instant" unitRef="shares" decimals="0">111000</ix:nonFraction></p>'
+            '<p><ix:nonFraction name="dei:EntityCommonStockSharesOutstanding" contextRef="c-instant" unitRef="shares" decimals="0">222000</ix:nonFraction></p>'
+        )
+        doc = InlineXbrlDocument(
+            make_ixbrl_bytes(contexts=_INSTANT_CTX, units=_SHARES_UNIT, facts=facts)
+        )
+        # _shares_and_securities returns ambiguous_shares=True
+        shares, _, _, ambiguous, *_ = extractor._shares_and_securities(doc)
+        assert ambiguous is True
+        assert shares is not None  # record still produced, not raised
+
+    def test_ambiguous_shares_failure_reported_by_extract(
+        self, extractor: CompanyFactsExtractor, sample_filing: Filing
+    ) -> None:
+        facts = (
+            '<p><ix:nonFraction name="dei:EntityCommonStockSharesOutstanding" contextRef="c-instant" unitRef="shares" decimals="0">111000</ix:nonFraction></p>'
+            '<p><ix:nonFraction name="dei:EntityCommonStockSharesOutstanding" contextRef="c-instant" unitRef="shares" decimals="0">222000</ix:nonFraction></p>'
+        )
+        doc = InlineXbrlDocument(
+            make_ixbrl_bytes(contexts=_INSTANT_CTX, units=_SHARES_UNIT, facts=facts)
+        )
+        record, failures, *_ = extractor.extract(sample_filing, doc)
+
+        assert FailureType.AMBIGUOUS_SHARES_OUTSTANDING in failures
+
+    def test_same_value_at_same_instant_not_flagged(
+        self, extractor: CompanyFactsExtractor, sample_filing: Filing
+    ) -> None:
+        # Two facts at the same instant but same value → not ambiguous.
+        facts = (
+            '<p><ix:nonFraction name="dei:EntityCommonStockSharesOutstanding" contextRef="c-instant" unitRef="shares" decimals="0">500000</ix:nonFraction></p>'
+            '<p><ix:nonFraction name="dei:EntityCommonStockSharesOutstanding" contextRef="c-instant" unitRef="shares" decimals="0">500000</ix:nonFraction></p>'
+        )
+        doc = InlineXbrlDocument(
+            make_ixbrl_bytes(contexts=_INSTANT_CTX, units=_SHARES_UNIT, facts=facts)
+        )
+        _, _, _, ambiguous, *_ = extractor._shares_and_securities(doc)
+        assert ambiguous is False
+
+
+# ── TestA5UnjoinedCounters ─────────────────────────────────────────────────────
+
+
+class TestA5UnjoinedCounters:
+    """A5: unmatched counters incremented per group, not per filing."""
+
+    def test_multiple_unmatched_dimensioned_increments_per_group(
+        self, extractor: CompanyFactsExtractor
+    ) -> None:
+        # No registered securities; two explicit-member facts → both unmatched.
+        # n_unmatched_explicit should be 2 (one per group), not 1 (per filing).
+        facts = (
+            '<p><ix:nonFraction name="dei:EntityCommonStockSharesOutstanding" contextRef="c-class-a" unitRef="shares" decimals="0">100</ix:nonFraction></p>'
+            '<p><ix:nonFraction name="dei:EntityCommonStockSharesOutstanding" contextRef="c-class-b" unitRef="shares" decimals="0">200</ix:nonFraction></p>'
+        )
+        doc = InlineXbrlDocument(
+            make_ixbrl_bytes(contexts=_CLASS_A_CTX + _CLASS_B_CTX, units=_SHARES_UNIT, facts=facts)
+        )
+        _, _, _, _, n_unmatched_explicit, n_unmatched_typed = extractor._shares_and_securities(doc)
+        assert n_unmatched_explicit == 2
+        assert n_unmatched_typed == 0
+
+    def test_dimensioned_and_typed_incremented_independently(
+        self, extractor: CompanyFactsExtractor
+    ) -> None:
+        # Two unmatched explicit-member groups + one typed-member group.
+        opaque_ctx = """
+        <xbrli:context id="c-opaque">
+          <xbrli:entity>
+            <xbrli:identifier scheme="http://www.sec.gov/CIK">0001234567</xbrli:identifier>
+            <xbrli:segment>
+              <xbrldi:explicitMember dimension="us-gaap:LegalEntityAxis">us-gaap:SubsidiaryMember</xbrldi:explicitMember>
+            </xbrli:segment>
+          </xbrli:entity>
+          <xbrli:period><xbrli:instant>2024-09-28</xbrli:instant></xbrli:period>
+        </xbrli:context>"""
+        typed_ctx = """
+        <xbrli:context id="c-typed">
+          <xbrli:entity>
+            <xbrli:identifier scheme="http://www.sec.gov/CIK">0001234567</xbrli:identifier>
+            <xbrli:segment>
+              <xbrldi:typedMember dimension="us-gaap:SomeAxis"><us-gaap:Val>1</us-gaap:Val></xbrldi:typedMember>
+            </xbrli:segment>
+          </xbrli:entity>
+          <xbrli:period><xbrli:instant>2024-09-28</xbrli:instant></xbrli:period>
+        </xbrli:context>"""
+        facts = (
+            '<p><ix:nonFraction name="dei:EntityCommonStockSharesOutstanding" contextRef="c-class-a" unitRef="shares" decimals="0">100</ix:nonFraction></p>'
+            '<p><ix:nonFraction name="dei:EntityCommonStockSharesOutstanding" contextRef="c-opaque" unitRef="shares" decimals="0">200</ix:nonFraction></p>'
+            '<p><ix:nonFraction name="dei:EntityCommonStockSharesOutstanding" contextRef="c-typed" unitRef="shares" decimals="0">300</ix:nonFraction></p>'
+        )
+        doc = InlineXbrlDocument(
+            make_ixbrl_bytes(
+                contexts=_CLASS_A_CTX + opaque_ctx + typed_ctx,
+                units=_SHARES_UNIT,
+                facts=facts,
+            )
+        )
+        _, _, _, _, n_unmatched_explicit, n_unmatched_typed = extractor._shares_and_securities(doc)
+        assert (
+            n_unmatched_explicit == 2
+        )  # class-axis and non-standard-axis both count as dimensioned
+        assert n_unmatched_typed == 1

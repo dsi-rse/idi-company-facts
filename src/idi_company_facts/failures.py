@@ -21,6 +21,7 @@ class FailureType(StrEnum):
     MISSING_PERIOD_END = "missing_period_end"  # dei:DocumentPeriodEndDate is missing, cannot anchor facts to this filing's period
     NO_REVENUE_CONCEPT = "no_revenue_concept"  # None of the top-line (i.e. total) revenue concepts are present for this filing's year
     AMBIGUOUS_REVENUE = "ambiguous_revenue"  # Multiple top-line revenue concepts for the same period with conflicting values
+    AMBIGUOUS_SHARES_OUTSTANDING = "ambiguous_shares_outstanding"  # Multiple dimensionless share-count facts at the same instant with conflicting values
 
 
 class CompanyFactsFailureClassifier(FailureClassifier):
@@ -35,6 +36,7 @@ class CompanyFactsFailureClassifier(FailureClassifier):
             FailureType.MISSING_PERIOD_END,
             FailureType.NO_REVENUE_CONCEPT,
             FailureType.AMBIGUOUS_REVENUE,
+            FailureType.AMBIGUOUS_SHARES_OUTSTANDING,
         }
     )
 
