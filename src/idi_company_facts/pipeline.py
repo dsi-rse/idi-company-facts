@@ -439,9 +439,10 @@ class CompanyFactsPipeline(Pipeline):
         while True:
             filing = work_queue.get()
             try:
-                new_records = self._process_one(filing)
-                with records_lock:
-                    records.extend(new_records)
+                record = self._process_one(filing)
+                if record is not None:
+                    with records_lock:
+                        records.append(record)
                 self.stats.increment("filings_processed")
                 n = self.stats.filings_processed  # approximate read outside the lock
                 if n % self._LOG_EVERY == 0:
@@ -498,10 +499,10 @@ class CompanyFactsPipeline(Pipeline):
 
         return records
 
-    def _process_one(self, filing: Filing) -> list[CompanyFactsRecord]:
+    def _process_one(self, filing: Filing) -> CompanyFactsRecord | None:
         """Fetch, parse, and extract facts from one filing's primary document.
 
-        Returns one record per security class; empty list on any failure.
+        Returns the extracted record, or None on any failure.
         """
         s3_url = filing.primary_s3_key  # manifest s3_key is already a full s3:// URL
         try:
@@ -510,12 +511,14 @@ class CompanyFactsPipeline(Pipeline):
                 self.failures.add((filing.cik, filing.accession_number), FailureType.EMPTY_DOCUMENT)
                 self.stats.increment("storage_errors")
                 self._report_disposition(filing.cik, f"failed({FailureType.EMPTY_DOCUMENT})")
-                return []
+                return None
             self.stats.increment("documents_fetched")
             doc = InlineXbrlDocument(html_bytes)
             if doc.used_recovery_parser:
                 self.stats.increment("recovered_parse")
-            records, extraction_failures = self.extractor.extract(filing, doc)
+            record, extraction_failures, n_unmatched_explicit, n_unmatched_typed = (
+                self.extractor.extract(filing, doc)
+            )
             for failure_type in extraction_failures:
                 self.failures.add((filing.cik, filing.accession_number), failure_type)
                 if failure_type == FailureType.MISSING_PERIOD_END:
@@ -524,47 +527,43 @@ class CompanyFactsPipeline(Pipeline):
                     self.stats.increment("no_revenue_concept")
                 elif failure_type == FailureType.AMBIGUOUS_REVENUE:
                     self.stats.increment("ambiguous_revenue")
-            for record in records:
-                # Multiple registered securities is expected (ADS + ordinary
-                # shares, dual-class, listed notes)
-                if len(record.registered_securities) > 1:
-                    self.stats.increment("multiple_registered_securities")
-                    self.logger.info(
-                        "%s registered %d securities: %s (common stock: %s)",
-                        filing.accession_number,
-                        len(record.registered_securities),
-                        ", ".join(
-                            f"{s.ticker or s.security_name or '<untitled>'}[{s.security_type}]"
-                            for s in record.registered_securities
-                        ),
-                        record.registered_securities[0].ticker
-                        or record.registered_securities[0].security_name
-                        or "<none>",
-                    )
-            self.stats.increment("extracted_documents", len(records))
-            if records:
-                self._report_disposition(filing.cik, "processed")
-            elif extraction_failures:
-                self._report_disposition(filing.cik, f"failed({extraction_failures[0]})")
-            else:
-                self._report_disposition(filing.cik, "failed(no_records)")
-            return records
+                elif failure_type == FailureType.AMBIGUOUS_SHARES_OUTSTANDING:
+                    self.stats.increment("ambiguous_shares_outstanding")
+            if n_unmatched_explicit:
+                self.stats.increment("unmatched_explicit", n_unmatched_explicit)
+            if n_unmatched_typed:
+                self.stats.increment("unmatched_typed_member", n_unmatched_typed)
+            # Multiple registered securities is expected (ADS + ordinary shares, dual-class, listed notes)
+            if len(record.registered_securities) > 1:
+                self.stats.increment("multiple_registered_securities")
+                self.logger.info(
+                    "%s registered %d securities: %s",
+                    filing.accession_number,
+                    len(record.registered_securities),
+                    ", ".join(
+                        s.ticker or s.security_name or s.dimensioned_members or "<untitled>"
+                        for s in record.registered_securities
+                    ),
+                )
+            self.stats.increment("extracted_documents")
+            self._report_disposition(filing.cik, "processed")
+            return record
         except NotInlineXbrlError:
             self.failures.add((filing.cik, filing.accession_number), FailureType.NO_INLINE_XBRL)
             self.stats.increment("parse_failures")
             self._report_disposition(filing.cik, f"failed({FailureType.NO_INLINE_XBRL})")
-            return []
+            return None
         except XbrlParseError:
             self.failures.add((filing.cik, filing.accession_number), FailureType.MALFORMED_XBRL)
             self.stats.increment("parse_failures")
             self._report_disposition(filing.cik, f"failed({FailureType.MALFORMED_XBRL})")
-            return []
+            return None
         except Exception:
             self.logger.exception("Unexpected error processing %s", filing.accession_number)
             self.failures.add((filing.cik, filing.accession_number), FailureType.STORAGE_ERROR)
             self.stats.increment("storage_errors")
             self._report_disposition(filing.cik, f"failed({FailureType.STORAGE_ERROR})")
-            return []
+            return None
 
     def save_output(self, processed_list: list[CompanyFactsRecord]) -> None:
         """Merge extracted records into the output parquet file.
@@ -591,8 +590,19 @@ class CompanyFactsPipeline(Pipeline):
         )
         df["all_tickers"] = securities.map(lambda secs: " | ".join(s["ticker"] for s in secs))
         df["all_exchanges"] = securities.map(lambda secs: " | ".join(s["exchange"] for s in secs))
-        df["all_security_types"] = securities.map(
-            lambda secs: " | ".join(s["security_type"] for s in secs)
+        df["all_dimensioned_members"] = securities.map(
+            lambda secs: " | ".join(s["dimensioned_members"] for s in secs)
+        )
+        df["all_shares_outstanding"] = securities.map(
+            lambda secs: " | ".join(s["shares_outstanding"] for s in secs)
+        )
+        df["all_shares_outstanding_as_of"] = securities.map(
+            lambda secs: " | ".join(
+                s["shares_outstanding_as_of"].isoformat()
+                if s["shares_outstanding_as_of"] is not None
+                else ""
+                for s in secs
+            )
         )
         df = df.drop_duplicates(subset=["company_cik", "accession_number"])
         existing_raw = load_content(self.config.output_file)
@@ -626,10 +636,17 @@ class CompanyFactsPipeline(Pipeline):
         self.logger.info("    Storage errors:     %d", self.stats.storage_errors)
         self.logger.info("    Recovery parses:    %d", self.stats.recovered_parse)
         self.logger.info("  Extraction Quality")
-        self.logger.info("    Missing period end: %d", self.stats.missing_period_end)
-        self.logger.info("    No revenue concept: %d", self.stats.no_revenue_concept)
-        self.logger.info("    Ambiguous revenue:  %d", self.stats.ambiguous_revenue)
-        self.logger.info("    Multiple securities: %d", self.stats.multiple_registered_securities)
+        self.logger.info("    Missing period end:      %d", self.stats.missing_period_end)
+        self.logger.info("    No revenue concept:      %d", self.stats.no_revenue_concept)
+        self.logger.info("    Ambiguous revenue:       %d", self.stats.ambiguous_revenue)
+        self.logger.info("    Ambiguous shares:        %d", self.stats.ambiguous_shares_outstanding)
+        self.logger.info(
+            "    Multiple securities:     %d", self.stats.multiple_registered_securities
+        )
+        unmatched_total = self.stats.unmatched_explicit + self.stats.unmatched_typed_member
+        self.logger.info("    Unmatched share groups:   %d total", unmatched_total)
+        self.logger.info("      dimensioned:           %d", self.stats.unmatched_explicit)
+        self.logger.info("      typed-member:          %d", self.stats.unmatched_typed_member)
         self.logger.info("=" * 40)
         self._display_cik_report()
 

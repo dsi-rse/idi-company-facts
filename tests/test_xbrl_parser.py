@@ -65,7 +65,7 @@ class TestContextParsing:
             )
         )
         ctx = doc.single_fact("dei:EntityPublicFloat").context
-        assert ctx.instant == datetime.date(2024, 9, 28)
+        assert ctx.as_of_date == datetime.date(2024, 9, 28)
         assert ctx.start is None
         assert ctx.end is None
         assert not ctx.has_dimensions
@@ -80,7 +80,7 @@ class TestContextParsing:
         ctx = doc.single_fact("dei:EntityRegistrantName").context
         assert ctx.start == datetime.date(2023, 9, 30)
         assert ctx.end == datetime.date(2024, 9, 28)
-        assert ctx.instant is None
+        assert ctx.as_of_date is None
 
     def test_dimensioned_context_flagged(self) -> None:
         doc = InlineXbrlDocument(
