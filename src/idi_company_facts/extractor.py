@@ -9,6 +9,7 @@ from idi_ftm2j_shared.logs import get_logger
 from idi_company_facts.failures import FailureType
 from idi_company_facts.types import (
     CompanyFactsRecord,
+    Dimension,
     Fact,
     Filing,
     RegisteredSecurity,
@@ -49,12 +50,17 @@ def _normalize_ticker(raw: str) -> str:
     return "" if ticker.lower() in _PLACEHOLDER_TICKERS else ticker
 
 
-def _format_dimensions(dimensions: frozenset[tuple[str, str]]) -> str:
-    """Format (axis, member) pairs as a sorted ``axis=member`` string.
+def _format_dimensions(dimensions: frozenset[Dimension]) -> str:
+    """Format Dimension pairs as a sorted ``axis=member`` string.
 
     Multiple pairs are joined by ``"; "``.  Empty frozenset returns ``""``.
+
+    The ``=`` separator is safe for both explicit and typed members because the
+    axis is always a QName (NCNames cannot contain ``=``).  To parse back, split
+    each ``"; "``-delimited token on the **first** ``=`` only (``str.split("=", 1)``)
+    — typed member values may themselves contain ``=``.
     """
-    return "; ".join(f"{ax}={mb}" for ax, mb in sorted(dimensions))
+    return "; ".join(f"{d.axis}={d.member}" for d in sorted(dimensions, key=lambda d: d.axis))
 
 
 class CompanyFactsExtractor:
@@ -87,10 +93,10 @@ class CompanyFactsExtractor:
             pairs; a group with no matching security becomes a stub row.
 
             ``n_unmatched_typed``: count of typed-member share groups with no matching
-            registered security.  A typed-member context (``xbrli:typedMember``) identifies
-            the axis by QName but the member value is free-form XML — not a concept QName —
-            so it cannot be matched to a registered security.  Groups are keyed by the
-            frozenset of axis QNames; each distinct axis set becomes one stub row.
+            registered security.  A typed-member context (``xbrli:typedMember``) has the
+            same (axis, member) structure but the member is a free-form string rather than
+            a taxonomy QName.  Matched against typed-member securities by exact pair-set
+            equality; unmatched groups become stubs.
 
             Both counters are incremented once per unmatched group, not once per fact.
         """
@@ -192,8 +198,9 @@ class CompanyFactsExtractor:
         n_unmatched_explicit: count of explicit-member share groups with no matching
         registered security, incremented once per group.
 
-        n_unmatched_typed: count of typed-member share groups (distinct typed_dimensions sets)
-        with no matching registered security, incremented once per group.
+        n_unmatched_typed: count of typed-member share groups (distinct (axis, member string)
+        pair sets) with no matching registered security, incremented once per group.  A typed
+        security tagged with the same (axis, member string) pair set will match.
         """
         shares_facts = [
             f
@@ -224,9 +231,9 @@ class CompanyFactsExtractor:
             shares_value = None
             shares_date = None
 
-        entries = self._registered_securities(doc)
+        explicit_entries, typed_entries = self._registered_securities(doc)
         securities, n_unmatched_explicit, n_unmatched_typed = self._attribute_shares(
-            doc, entries, accession_number, shares_value
+            doc, explicit_entries, typed_entries, accession_number, shares_value
         )
         return (
             shares_value,
@@ -240,24 +247,33 @@ class CompanyFactsExtractor:
     def _attribute_shares(
         self,
         doc: InlineXbrlDocument,
-        entries: list[tuple[frozenset[tuple[str, str]], RegisteredSecurity]],
+        explicit_entries: list[tuple[frozenset[Dimension], RegisteredSecurity]],
+        typed_entries: list[tuple[frozenset[Dimension], RegisteredSecurity]],
         accession_number: str = "",
         scalar: Decimal | None = None,
     ) -> tuple[list[RegisteredSecurity], int, int]:
-        """Attribute dimensioned share counts to securities; append unmatched rows.
+        """Attribute dimensioned share counts to securities; append unmatched rows as stubs.
 
-        Groups dimensioned EntityCommonStockSharesOutstanding facts by their
-        full (axis, member) pair-set.  Takes the latest as-of-date fact per group,
-        then matches it to a registered security whose stored pair-set is equal.
-        Unmatched groups are appended as stub securities.
+        Both explicit-member and typed-member contexts are treated symmetrically as
+        (axis, member) pairs grouped by their full frozenset, then matched against their
+        respective security pool by exact pair-set equality:
+
+        - Explicit (``xbrli:explicitMember``): member is a QName referencing a
+          named concept in a taxonomy (``prefix:localName`` format).
+          Matched against ``explicit_entries``.
+        - Typed (``xbrli:typedMember``): member is a free-form string constrained only
+          by an XML Schema type, not a fixed taxonomy.  Matched against
+          ``typed_entries``.
+
+        Keeping the pools separate prevents cross-matching between an explicit-member
+        share count and a typed-member security (or vice versa) whose (axis, value)
+        strings happen to coincide.  Unmatched groups in either pool become stub rows
+        appended after all security rows, with empty name/ticker/exchange and
+        ``dimensioned_members`` set to the ``"axis=member"``-formatted pairs.
 
         Returns:
-            (securities, n_unmatched_explicit, n_unmatched_typed) where
-            n_unmatched_explicit is the count of explicit-member groups with no
-            matching registered security, and n_unmatched_typed is the count of
-            typed-member groups (grouped by typed_axes frozenset) with no matching
-            registered security.  Each counter is incremented once per unmatched
-            group, not once per fact.
+            (securities, n_unmatched_explicit, n_unmatched_typed) where each counter is
+            incremented once per unmatched group, not once per fact.
         """
         dim_facts = [
             f
@@ -267,36 +283,38 @@ class CompanyFactsExtractor:
             and f.context.as_of_date is not None
         ]
 
+        all_entries = explicit_entries + typed_entries
         if not dim_facts:
-            return [sec for _, sec in entries], 0, 0
+            return [sec for _, sec in all_entries], 0, 0
 
-        # Partition dim_facts by group type.
-        # Explicit-member facts keyed by full (axis, member QName) pair-set.
-        # Typed-member facts keyed by (axis, child text value) pair-set.
-        explicit_groups: dict[frozenset[tuple[str, str]], list] = {}
-        typed_groups: dict[frozenset[tuple[str, str]], list] = {}
+        # Partition share count facts by member type.
+        # Explicit-member facts keyed by their explicit Dimension pair-set.
+        # Typed-member facts keyed by their typed Dimension pair-set.
+        explicit_groups: dict[frozenset[Dimension], list] = {}
+        typed_groups: dict[frozenset[Dimension], list] = {}
 
         for f in dim_facts:
-            ctx = f.context
-            if not ctx.dimension_members:
-                # typedMember context: has_dimensions=True but no explicit members
-                typed_groups.setdefault(ctx.typed_dimensions, []).append(f)
-                continue
-            explicit_groups.setdefault(ctx.dimensions, []).append(f)
+            explicit_dims = frozenset(d for d in f.context.dimensions if not d.is_typed)
+            typed_dims = frozenset(d for d in f.context.dimensions if d.is_typed)
+            if explicit_dims:
+                explicit_groups.setdefault(explicit_dims, []).append(f)
+            elif typed_dims:
+                typed_groups.setdefault(typed_dims, []).append(f)
 
         def _best(facts: list[Fact]) -> Fact:
             return max(facts, key=lambda f: f.context.as_of_date or datetime.date.min)
 
-        sec_list: list[tuple[frozenset[tuple[str, str]], RegisteredSecurity]] = list(entries)
+        explicit_sec_list = list(explicit_entries)
+        typed_sec_list = list(typed_entries)
         appended: list[RegisteredSecurity] = []
-        n_unmatched_explicit = 0
 
-        def _write_or_stub(matched_idx: int | None, bf: Fact, dm: str) -> bool:
-            """Write share count to matched row, or append stub.
-
-            Stub, or empty string, is appended to the end of the all_* securities columns.
-            Returns True if stub.
-            """
+        def _write_or_stub(
+            sec_list: list[tuple[frozenset[Dimension], RegisteredSecurity]],
+            matched_idx: int | None,
+            bf: Fact,
+            dm: str,
+        ) -> bool:
+            """Write share count into matched security row, or append a stub. Returns True if stub."""
             if matched_idx is not None:
                 old_members, old_sec = sec_list[matched_idx]
                 sec_list[matched_idx] = (
@@ -317,67 +335,70 @@ class CompanyFactsExtractor:
             )
             return True
 
-        # Match all explicit-member groups by exact pair-set (axis=member) equality.
-        for pair_set, facts in explicit_groups.items():
-            bf = _best(facts)
-            matched_idx = None
-            for i, (pairs, _s) in enumerate(sec_list):
-                if pairs == pair_set:
-                    matched_idx = i
-                    break
-            dm = _format_dimensions(pair_set)
-            stub = _write_or_stub(matched_idx, bf, dm)
-            if stub:
-                n_unmatched_explicit += 1
-                _logger.info(
-                    "%s: unmatched explicit-member share group (%s)=%s",
-                    accession_number,
-                    dm,
-                    _fmt(bf.value),
+        def _match_and_attribute(
+            groups: dict[frozenset[Dimension], list],
+            sec_list: list[tuple[frozenset[Dimension], RegisteredSecurity]],
+            label: str,
+        ) -> int:
+            n_unmatched = 0
+            for pair_set, facts in groups.items():
+                bf = _best(facts)
+                matched_idx = next(
+                    (i for i, (pairs, _) in enumerate(sec_list) if pairs == pair_set), None
                 )
+                dm = _format_dimensions(pair_set)
+                if _write_or_stub(sec_list, matched_idx, bf, dm):
+                    n_unmatched += 1
+                    _logger.info(
+                        "%s: unmatched %s share group (%s)=%s",
+                        accession_number,
+                        label,
+                        dm,
+                        _fmt(bf.value),
+                    )
+            return n_unmatched
 
-        # Typed-member contexts: group by (axis, child-value) pair-set, one stub per distinct group.
-        n_unmatched_typed = 0
-        for typed_dims, facts in typed_groups.items():
-            bf = _best(facts)
-            typed_dm = _format_dimensions(typed_dims)
-            appended.append(
-                RegisteredSecurity(
-                    dimensioned_members=typed_dm,
-                    shares_outstanding=_fmt(bf.value),
-                    shares_outstanding_as_of=bf.context.as_of_date,
-                )
-            )
-            n_unmatched_typed += 1
-            _logger.info(
-                "%s: unmatched typed-member share group (%s)=%s; cannot attribute to a security",
-                accession_number,
-                typed_dm,
-                _fmt(bf.value),
-            )
+        n_unmatched_explicit = _match_and_attribute(
+            explicit_groups, explicit_sec_list, "explicit-member"
+        )
+        n_unmatched_typed = _match_and_attribute(typed_groups, typed_sec_list, "typed-member")
 
-        return [sec for _, sec in sec_list] + appended, n_unmatched_explicit, n_unmatched_typed
+        return (
+            [sec for _, sec in explicit_sec_list] + [sec for _, sec in typed_sec_list] + appended,
+            n_unmatched_explicit,
+            n_unmatched_typed,
+        )
 
     def _registered_securities(
         self, doc: InlineXbrlDocument
-    ) -> list[tuple[frozenset[tuple[str, str]], RegisteredSecurity]]:
+    ) -> tuple[
+        list[tuple[frozenset[Dimension], RegisteredSecurity]],
+        list[tuple[frozenset[Dimension], RegisteredSecurity]],
+    ]:
         """Collect every registered security tagged on the cover page.
 
-        Returns (dimensions, security) tuples in extraction order:
-        dimensionless groups first, then dimensioned groups in first-seen
-        document order.  The dimensions frozenset carries full (axis, member)
-        pairs and is used by :meth:`_attribute_shares` for exact-pair and
-        containment matching.
+        Returns ``(explicit_entries, typed_entries)`` where each is a list of
+        ``(dimensions, security)`` tuples in extraction order.
+
+        Explicit entries (dimensionless and explicit-member) come first;
+        typed entries (typed-member contexts) are returned separately so
+        :meth:`_attribute_shares` can match each pool against its own share
+        count groups.  Both use ``frozenset[Dimension]`` as the dimension key —
+        ``is_typed=False`` for explicit members, ``is_typed=True`` for typed.
         """
-        # Key dimensioned groups on the full (axis, member) pair-set so that
-        # the same member QName under different axes is treated as distinct.
-        dim_groups: dict[frozenset[tuple[str, str]], dict[str, str]] = {}
+        explicit_dim_groups: dict[frozenset[Dimension], dict[str, str]] = {}
+        typed_dim_groups: dict[frozenset[Dimension], dict[str, str]] = {}
         dimless_groups: dict[str, dict[str, str]] = {}
         for concept in _SECURITY_CONCEPTS:
             for f in doc.facts(concept):
                 ctx = f.context
                 if ctx.has_dimensions:
-                    slot = dim_groups.setdefault(ctx.dimensions, {})
+                    explicit_dims = frozenset(d for d in ctx.dimensions if not d.is_typed)
+                    typed_dims = frozenset(d for d in ctx.dimensions if d.is_typed)
+                    if explicit_dims:
+                        slot = explicit_dim_groups.setdefault(explicit_dims, {})
+                    else:
+                        slot = typed_dim_groups.setdefault(typed_dims, {})
                 else:
                     slot = dimless_groups.setdefault(ctx.context_id, {})
                 slot.setdefault(concept, str(f.value))
@@ -396,26 +417,30 @@ class CompanyFactsExtractor:
                         merged.setdefault(concept, value)
                 dimless_groups = {"|".join(sorted(dimless_groups)): merged}
 
-        entries: list[tuple[frozenset[tuple[str, str]], RegisteredSecurity]] = []
+        explicit_entries: list[tuple[frozenset[Dimension], RegisteredSecurity]] = []
 
-        # Dimensionless first.
+        # Dimensionless first, then explicit-dimension in first-seen document order.
         for slot in dimless_groups.values():
             sec = self._build_security(slot, frozenset())
             if sec is not None:
-                entries.append((frozenset(), sec))
-
-        # Dimensioned second, in first-seen document order.
-        for dimensions, slot in dim_groups.items():
-            sec = self._build_security(slot, dimensions)
+                explicit_entries.append((frozenset(), sec))
+        for dims, slot in explicit_dim_groups.items():
+            sec = self._build_security(slot, dims)
             if sec is not None:
-                entries.append((dimensions, sec))
+                explicit_entries.append((dims, sec))
 
-        return self._dedupe_securities(entries)
+        typed_entries: list[tuple[frozenset[Dimension], RegisteredSecurity]] = []
+        for typed_dims, slot in typed_dim_groups.items():
+            sec = self._build_security(slot, typed_dims)
+            if sec is not None:
+                typed_entries.append((typed_dims, sec))
+
+        return self._dedupe_securities(explicit_entries), typed_entries
 
     @staticmethod
     def _build_security(
         slot: dict[str, str],
-        dimensions: frozenset[tuple[str, str]],
+        dimensions: frozenset[Dimension],
     ) -> RegisteredSecurity | None:
         """Build a RegisteredSecurity from a concept→value slot, or None if empty.
 
@@ -442,8 +467,8 @@ class CompanyFactsExtractor:
 
     @staticmethod
     def _dedupe_securities(
-        entries: list[tuple[frozenset[tuple[str, str]], RegisteredSecurity]],
-    ) -> list[tuple[frozenset[tuple[str, str]], RegisteredSecurity]]:
+        entries: list[tuple[frozenset[Dimension], RegisteredSecurity]],
+    ) -> list[tuple[frozenset[Dimension], RegisteredSecurity]]:
         """Collapse entries describing the same security.
 
         Keyed by (ticker, dimensions) for ticker-bearing securities, or
@@ -454,7 +479,7 @@ class CompanyFactsExtractor:
 
         When duplicates do collide each field takes the first non-empty value.
         """
-        by_key: dict[tuple, tuple[frozenset[tuple[str, str]], RegisteredSecurity]] = {}
+        by_key: dict[tuple, tuple[frozenset[Dimension], RegisteredSecurity]] = {}
         for dimensions, sec in entries:
             if sec.ticker:
                 key: tuple = ("ticker", sec.ticker.lower(), dimensions)
