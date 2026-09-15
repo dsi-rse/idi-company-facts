@@ -709,7 +709,7 @@ class TestCiksOverride:
             "idi_company_facts.pipeline.iter_filings_by_form_type", return_value=iter([latest])
         )
         record = _make_record_with_securities([RegisteredSecurity(ticker="TST")])
-        mocker.patch.object(pipeline.extractor, "extract", return_value=([record], []))
+        mocker.patch.object(pipeline.extractor, "extract", return_value=(record, [], 0, 0))
         mocker.patch(
             "idi_company_facts.pipeline.InlineXbrlDocument", return_value=mocker.MagicMock()
         )
@@ -807,7 +807,7 @@ class TestRun:
             "idi_company_facts.pipeline.iter_filings_by_form_type",
             return_value=iter([good]),
         )
-        process_one = mocker.patch.object(pipeline, "_process_one", return_value=[])
+        process_one = mocker.patch.object(pipeline, "_process_one", return_value=None)
 
         pipeline.run()
 
@@ -1000,7 +1000,7 @@ class TestSaveOutput:
             security_name="Common Stock",
             ticker="AAPL",
             exchange="NASDAQ",
-            dimensioned_members="us-gaap:CommonStockMember",
+            dimensioned_members="us-gaap:StatementClassOfStockAxis=us-gaap:CommonStockMember",
         )
         record = _make_record_with_securities([sec])
 
@@ -1010,7 +1010,10 @@ class TestSaveOutput:
         assert df["all_tickers"].iloc[0] == "AAPL"
         assert df["all_security_names"].iloc[0] == "Common Stock"
         assert df["all_exchanges"].iloc[0] == "NASDAQ"
-        assert df["all_dimensioned_members"].iloc[0] == "us-gaap:CommonStockMember"
+        assert (
+            df["all_dimensioned_members"].iloc[0]
+            == "us-gaap:StatementClassOfStockAxis=us-gaap:CommonStockMember"
+        )
         assert df["all_shares_outstanding"].iloc[0] == ""
         assert df["all_shares_outstanding_as_of"].iloc[0] == ""
 
@@ -1029,7 +1032,7 @@ class TestSaveOutput:
             security_name="American Depositary Shares",
             ticker="ADSX",
             exchange="NYSE",
-            dimensioned_members="us-gaap:AmericanDepositarySharesMember",
+            dimensioned_members="us-gaap:StatementClassOfStockAxis=us-gaap:AmericanDepositarySharesMember",
             shares_outstanding="500000000",
         )
         record = _make_record_with_securities([common, ads])
@@ -1040,7 +1043,10 @@ class TestSaveOutput:
         assert df["all_tickers"].iloc[0] == "ORD | ADSX"
         assert df["all_security_names"].iloc[0] == "Ordinary Shares | American Depositary Shares"
         assert df["all_exchanges"].iloc[0] == "Euronext Paris | NYSE"
-        assert df["all_dimensioned_members"].iloc[0] == " | us-gaap:AmericanDepositarySharesMember"
+        assert (
+            df["all_dimensioned_members"].iloc[0]
+            == " | us-gaap:StatementClassOfStockAxis=us-gaap:AmericanDepositarySharesMember"
+        )
         assert df["all_shares_outstanding"].iloc[0] == " | 500000000"
 
     def test_registered_securities_column_absent(
@@ -1065,9 +1071,13 @@ class TestSaveOutput:
         secs = [
             RegisteredSecurity(ticker="ORD", dimensioned_members=""),
             RegisteredSecurity(
-                ticker="ADSX", dimensioned_members="us-gaap:AmericanDepositarySharesMember"
+                ticker="ADSX",
+                dimensioned_members="us-gaap:StatementClassOfStockAxis=us-gaap:AmericanDepositarySharesMember",
             ),
-            RegisteredSecurity(ticker="ORD27", dimensioned_members="us-gaap:SeniorNotesMember"),
+            RegisteredSecurity(
+                ticker="ORD27",
+                dimensioned_members="us-gaap:StatementClassOfStockAxis=us-gaap:SeniorNotesMember",
+            ),
         ]
         record = _make_record_with_securities(secs)
 
@@ -1075,7 +1085,8 @@ class TestSaveOutput:
 
         df = pd.read_parquet(pipeline.config.output_file)
         assert df["all_dimensioned_members"].iloc[0] == (
-            " | us-gaap:AmericanDepositarySharesMember | us-gaap:SeniorNotesMember"
+            " | us-gaap:StatementClassOfStockAxis=us-gaap:AmericanDepositarySharesMember"
+            " | us-gaap:StatementClassOfStockAxis=us-gaap:SeniorNotesMember"
         )
 
     def test_merges_with_existing_output(
@@ -1119,7 +1130,7 @@ class TestSaveOutput:
             RegisteredSecurity(ticker="ADSX", exchange="NYSE"),
         ]
         record = _make_record_with_securities(two_secs)
-        mocker.patch.object(pipeline.extractor, "extract", return_value=([record], []))
+        mocker.patch.object(pipeline.extractor, "extract", return_value=(record, [], 0, 0))
         mocker.patch("idi_company_facts.pipeline.load_content", return_value=b"dummy")
         mocker.patch(
             "idi_company_facts.pipeline.InlineXbrlDocument", return_value=mocker.MagicMock()

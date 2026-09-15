@@ -28,15 +28,15 @@ class Context:
     """An iXBRL reporting context."""
 
     context_id: str
-    instant: datetime.date | None
+    as_of_date: datetime.date | None
     start: datetime.date | None
     end: datetime.date | None
     has_dimensions: bool
     dimension_members: frozenset[str] = frozenset()
     # (axis QName, member QName) pairs as written in the document (raw prefixes).
     dimensions: frozenset[tuple[str, str]] = frozenset()
-    # Axis QNames from typedMember elements (values are free-form XML, not stored).
-    typed_axes: frozenset[str] = frozenset()
+    # (axis QName, child text value) pairs from typedMember elements.
+    typed_dimensions: frozenset[tuple[str, str]] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -137,9 +137,11 @@ class PipelineStats:
     missing_period_end: int = 0
     no_revenue_concept: int = 0
     ambiguous_revenue: int = 0
+    ambiguous_shares_outstanding: int = 0
     multiple_registered_securities: int = 0
     recovered_parse: int = 0
-    unjoined_share_classes: int = 0
+    unmatched_explicit: int = 0
+    unmatched_typed_member: int = 0
 
     def __post_init__(self) -> None:
         """Initialize the pipeline stats."""
@@ -163,13 +165,17 @@ class RegisteredSecurity:
     Fields map to the DEI concepts dei:Security12bTitle, dei:TradingSymbol,
     and dei:SecurityExchangeName respectively. Any field may be empty.
 
-    ``dimensioned_members`` holds the class-axis member QName for class-axis
-    securities; sorted explicit member QNames joined ``"; "`` for unmatched
-    opaque rows; and ``""`` for dimensionless securities and typed-member rows.
+    ``dimensioned_members`` holds all explicit (axis, member) pairs from the
+    security's XBRL context, formatted as ``"axis=member"`` and joined by
+    ``"; "`` in sorted order.  Empty for dimensionless securities and
+    typed-member stub rows.
 
     ``shares_outstanding`` and ``shares_outstanding_as_of`` are populated by
     the attribution step when a dimensioned EntityCommonStockSharesOutstanding
-    fact is matched to this security.
+    fact is matched to this security.  Not populated for dimensionless
+    securities even when a dimensionless share count exists — that count appears
+    in ``CompanyFactsRecord.shares_outstanding`` instead.  A missing value here
+    does not imply the security has no share count.
     """
 
     security_name: str = ""
@@ -194,11 +200,14 @@ class CompanyFactsRecord:
     company_name: str = ""
     # All registered securities found on the cover page in extraction order
     # (dimensionless first, then dimensioned, then appended unmatched share rows).
-    # ``shares_outstanding`` (scalar) holds only a dimensionless fact value.
     registered_securities: list[RegisteredSecurity] = field(default_factory=list)
     market_value: str = ""
     market_value_as_of_date: date | None = None
     market_value_currency: str = ""
+    # Dimensionless EntityCommonStockSharesOutstanding fact (entity-level count).
+    # This scalar has no guaranteed relationship to per-class counts in
+    # registered_securities: it may be a total, it may cover only one class, or
+    # it may refer to a non-publicly-traded class not broken out separately.
     shares_outstanding: str = ""
     shares_outstanding_as_of_date: date | None = None
     is_shell_company: str = ""
