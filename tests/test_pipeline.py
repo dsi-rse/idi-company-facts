@@ -556,7 +556,7 @@ class TestCiksOverride:
         pipeline.load_input()
 
         # The 2024-03-01 filing predates the 2024-12-31 report date, so the walk
-        # stops there and the 2023 filing is never read.
+        # stops there and the 2024 and 2023 filings are never read.
         assert mock_get.call_count == 1
 
     def test_missing_report_dates_fall_back_to_latest_filing(
@@ -578,6 +578,31 @@ class TestCiksOverride:
         filings = pipeline.load_input()
 
         assert [f.accession_number for f in filings] == ["0000000123-24-000001"]
+
+    def test_newest_filing_without_report_date_wins_over_dated_older_filing(
+        self, config: PipelineConfig, mocker: MockerFixture
+    ) -> None:
+        """A newest filing lacking report_date is used, not an older filing that has one.
+
+        Pre-migration newest filing plus a re-scraped older one is a realistic state
+        after partial re-scrapes; the older period must not be processed instead.
+        """
+        rows = [
+            ("10-K", "2023-03-01", "123", "0000000123-23-000001", "2022-12-31"),
+            ("10-K", "2024-03-01", "123", "0000000123-24-000001", ""),
+        ]
+        pipeline = self._override_pipeline(config, mocker, rows, ciks=("123",))
+        latest = make_manifest(
+            cik="123", accession_number="0000000123-24-000001", filing_date="2024-03-01"
+        )
+        mock_iter = mocker.patch(
+            "idi_company_facts.pipeline.iter_filings_by_form_type", return_value=iter([latest])
+        )
+
+        filings = pipeline.load_input()
+
+        assert [f.accession_number for f in filings] == ["0000000123-24-000001"]
+        assert mock_iter.call_args.kwargs["start_date"] == date(2024, 3, 1)
 
     def test_zero_padded_request_matches_unpadded_manifest(
         self, config: PipelineConfig, mocker: MockerFixture

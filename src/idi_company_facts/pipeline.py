@@ -46,7 +46,9 @@ _MANIFEST_OVERRIDE_COLUMNS = ["form_type", "filing_date", "cik", "accession_numb
 
 # Ceiling on per-filing manifest.json reads per CIK while walking back to the
 # most recent report date. The walk normally stops after two or three filings
-# (see _latest_report_group); this only bounds pathological histories.
+# (see _latest_report_group); this only bounds pathological histories. The walk
+# exists only because manifest.parquet has no report_date column; a scraper-side
+# column would retire it along with this ceiling.
 _MAX_REPORT_DATE_LOOKUPS = 12
 
 
@@ -359,7 +361,8 @@ class CompanyFactsPipeline(Pipeline):
 
         Returns:
             The matching filings, newest filing first. Falls back to the single
-            newest filing when no candidate manifest carries a report date.
+            newest filing when its manifest carries no report date, since older
+            filings cannot then be matched to its period.
         """
         group: list[OverrideTarget] = []
         best = ""
@@ -367,6 +370,11 @@ class CompanyFactsPipeline(Pipeline):
             if best and filing_date < best:
                 break
             report_date = self._report_date(cik, accession, form_type, filing_date)
+            if not report_date and not best:
+                # The newest filing has no report_date, so nothing older can be
+                # shown to share its period. Fall back to it rather than letting
+                # an older, dated filing win the walk.
+                break
             if not report_date or report_date < best:
                 continue
             if report_date > best:
@@ -385,7 +393,7 @@ class CompanyFactsPipeline(Pipeline):
             # of processing just the most recently filed target filing.
             cik, accession, form_type, filing_date = candidates[0]
             self.logger.warning(
-                "CIK %s: no report_date on any candidate filing manifest; "
+                "CIK %s: no report_date on the newest candidate filing manifest; "
                 "falling back to the latest filing %s",
                 cik,
                 accession,
