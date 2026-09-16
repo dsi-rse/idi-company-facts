@@ -8,6 +8,7 @@ import queue
 import re
 import threading
 from abc import ABC, abstractmethod
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict
 from pathlib import Path
 
@@ -15,7 +16,12 @@ from pathlib import Path
 import pandas as pd
 from idi_ftm2j_shared.failures import FailureRegistry
 from idi_ftm2j_shared.logs import get_logger
-from idi_ftm2j_shared.sec import ScrapedDocument, ScrapedFiling, iter_filings_by_form_type
+from idi_ftm2j_shared.sec import (
+    ScrapedDocument,
+    ScrapedFiling,
+    get_filing,
+    iter_filings_by_form_type,
+)
 from idi_ftm2j_shared.storage import load_content
 
 # Application imports
@@ -26,6 +32,7 @@ from idi_company_facts.types import (
     CikOverrideSummary,
     CompanyFactsRecord,
     Filing,
+    OverrideTarget,
     PipelineConfig,
     PipelineStats,
 )
@@ -34,8 +41,15 @@ from idi_company_facts.xbrl.parser import InlineXbrlDocument, NotInlineXbrlError
 # Bucket-level query index written by idi-sec-scraper (one row per scraped document).
 SEC_MANIFEST_KEY = "sec/manifest.parquet"
 
-# Columns needed to resolve each override CIK to its latest target filing.
+# Columns needed to resolve each override CIK to its latest report-date group.
 _MANIFEST_OVERRIDE_COLUMNS = ["form_type", "filing_date", "cik", "accession_number"]
+
+# Ceiling on per-filing manifest.json reads per CIK while walking back to the
+# most recent report date. The walk normally stops after two or three filings
+# (see _latest_report_group); this only bounds pathological histories. The walk
+# exists only because manifest.parquet has no report_date column; a scraper-side
+# column would retire it along with this ceiling.
+_MAX_REPORT_DATE_LOOKUPS = 12
 
 
 def normalize_cik(cik: str) -> str:
@@ -186,8 +200,8 @@ class CompanyFactsPipeline(Pipeline):
             flush_every=config.failure_flush_every,
         )
         self.extractor = CompanyFactsExtractor()
-        # Populated only in --ciks-override mode: normalized CIK → summary.
-        self.cik_report: dict[str, CikOverrideSummary] = {}
+        # Populated only in --ciks-override mode: (normalized CIK, accession) → summary.
+        self.cik_report: dict[tuple[str, str], CikOverrideSummary] = {}
         self._report_lock = threading.Lock()
 
     def run(self) -> None:
@@ -225,8 +239,11 @@ class CompanyFactsPipeline(Pipeline):
     def _collect_override_filings(
         self, filings: list[Filing], existing: frozenset[tuple[str, str]]
     ) -> None:
-        """Resolve each override CIK to its latest target filing and collect it.
+        """Resolve each override CIK to its latest report-date group and collect it.
 
+        A CIK resolves to every target filing sharing its most recent report
+        date — the annual report plus any amendments of the same period — so the
+        downstream per-field merge across a 10-K and its 10-K/A has every input.
         Filings whose (cik, accession) pair is already present in the output
         parquet are skipped (``already_in_output``); CIKs with no target filing
         in the manifest are reported as ``NO_TARGET_FILING_IN_MANIFEST``.
@@ -236,42 +253,72 @@ class CompanyFactsPipeline(Pipeline):
             existing: (normalized cik, accession) pairs already in the output.
         """
         requested = [normalize_cik(cik) for cik in self.config.ciks]
-        self.cik_report = {cik: CikOverrideSummary(cik=cik) for cik in requested}
+        self.cik_report = {}
 
-        targets = self._latest_filings_by_cik(frozenset(requested))
+        targets = self._latest_report_groups(requested)
 
         # Group remaining targets by filing date so each date needs one manifest query.
         by_date: dict[datetime.date, set[tuple[str, str]]] = {}
         for cik in requested:
-            summary = self.cik_report[cik]
-            target = targets.get(cik)
-            if target is None:
-                summary.disposition = "NO_TARGET_FILING_IN_MANIFEST"
+            group = targets.get(cik)
+            if not group:
+                self.cik_report[(cik, "")] = CikOverrideSummary(
+                    cik=cik, disposition="NO_TARGET_FILING_IN_MANIFEST"
+                )
                 continue
-            raw_cik, accession, form_type, filing_date = target
-            summary.form_type = form_type
-            summary.filing_date = filing_date
-            summary.accession_number = accession
-            if (cik, accession) in existing:
-                summary.disposition = "already_in_output"
-                continue
-            date = datetime.date.fromisoformat(filing_date)
-            by_date.setdefault(date, set()).add((raw_cik, accession))
+            for target in group:
+                summary = CikOverrideSummary(
+                    cik=cik,
+                    form_type=target.form_type,
+                    filing_date=target.filing_date,
+                    report_date=target.report_date,
+                    accession_number=target.accession_number,
+                )
+                self.cik_report[(cik, target.accession_number)] = summary
+                if (cik, target.accession_number) in existing:
+                    summary.disposition = "already_in_output"
+                    continue
+                date = datetime.date.fromisoformat(target.filing_date)
+                by_date.setdefault(date, set()).add((target.cik, target.accession_number))
 
         for date, keys in sorted(by_date.items()):
             # existing is empty here: already-in-output targets were excluded above.
             self._collect_filings(date, date, frozenset(keys), filings, search_by="filing_date")
 
-    def _latest_filings_by_cik(
-        self, requested: frozenset[str]
-    ) -> dict[str, tuple[str, str, str, str]]:
-        """Select the max-filing_date target filing per requested CIK from the manifest.
+    def _latest_report_groups(self, requested: list[str]) -> dict[str, list[OverrideTarget]]:
+        """Resolve each requested CIK to the filings sharing its latest report date.
 
         Args:
             requested: Normalized CIKs to resolve.
 
         Returns:
             Dict mapping each normalized CIK with at least one target filing to
+            its latest report-date group, newest filing first.
+
+        Raises:
+            ValueError: If the SEC bucket has no manifest.parquet.
+        """
+        candidates = self._override_candidates(frozenset(requested))
+        found = [cik for cik in requested if candidates.get(cik)]
+        if not found:
+            return {}
+        with ThreadPoolExecutor(max_workers=self.config.num_workers) as pool:
+            groups = pool.map(
+                lambda cik: self._latest_report_group(candidates[cik]),
+                found,
+            )
+        return dict(zip(found, groups, strict=True))
+
+    def _override_candidates(
+        self, requested: frozenset[str]
+    ) -> dict[str, list[tuple[str, str, str, str]]]:
+        """Return each requested CIK's target filings, newest filing date first.
+
+        Args:
+            requested: Normalized CIKs to resolve.
+
+        Returns:
+            Dict mapping normalized CIK to a list of
             ``(manifest cik, accession_number, form_type, filing_date)``.
 
         Raises:
@@ -284,15 +331,109 @@ class CompanyFactsPipeline(Pipeline):
         df = df[df["form_type"].isin(self.config.form_types or TARGET_FORM_TYPES)]
         df = df.assign(cik_norm=df["cik"].astype(str).map(normalize_cik))
         df = df[df["cik_norm"].isin(requested)]
-        # filing_date is an ISO string, so lexicographic max is chronological;
+        # The manifest holds one row per document; collapse to one row per filing.
+        df = df.drop_duplicates(["cik_norm", "accession_number"])
+        # filing_date is an ISO string, so lexicographic order is chronological;
         # accession_number breaks same-day ties deterministically.
-        df = df.sort_values(["filing_date", "accession_number"]).drop_duplicates(
-            "cik_norm", keep="last"
-        )
-        return {
-            row.cik_norm: (str(row.cik), row.accession_number, row.form_type, row.filing_date)
-            for row in df.itertuples()
-        }
+        df = df.sort_values(["filing_date", "accession_number"], ascending=False)
+        candidates: dict[str, list[tuple[str, str, str, str]]] = {}
+        for row in df.itertuples():
+            candidates.setdefault(row.cik_norm, []).append(
+                (str(row.cik), row.accession_number, row.form_type, row.filing_date)
+            )
+        return candidates
+
+    def _latest_report_group(
+        self, candidates: list[tuple[str, str, str, str]]
+    ) -> list[OverrideTarget]:
+        """Select the filings sharing the latest report date from one CIK's candidates.
+
+        Report dates live in each filing's ``manifest.json``, not in the bucket
+        manifest, so candidates are walked newest-filing-first and read one at a
+        time. A filing's report date can never exceed its filing date, so once a
+        candidate was filed before the best report date found so far, no older
+        candidate can match or beat it and the walk stops — in practice after two
+        or three reads.
+
+        Args:
+            candidates: ``(manifest cik, accession_number, form_type, filing_date)``
+                tuples for one CIK, newest filing date first.
+
+        Returns:
+            The matching filings, newest filing first. Falls back to the single
+            newest filing when its manifest carries no report date, since older
+            filings cannot then be matched to its period.
+        """
+        group: list[OverrideTarget] = []
+        best = ""
+        for cik, accession, form_type, filing_date in candidates[:_MAX_REPORT_DATE_LOOKUPS]:
+            if best and filing_date < best:
+                break
+            report_date = self._report_date(cik, accession, form_type, filing_date)
+            if not report_date and not best:
+                # The newest filing has no report_date, so nothing older can be
+                # shown to share its period. Fall back to it rather than letting
+                # an older, dated filing win the walk.
+                break
+            if not report_date or report_date < best:
+                continue
+            if report_date > best:
+                best, group = report_date, []
+            group.append(
+                OverrideTarget(
+                    cik=cik,
+                    accession_number=accession,
+                    form_type=form_type,
+                    filing_date=filing_date,
+                    report_date=report_date,
+                )
+            )
+        if not group and candidates:
+            # Pre-migration manifests carry no report_date: keep the old behaviour
+            # of processing just the most recently filed target filing.
+            cik, accession, form_type, filing_date = candidates[0]
+            self.logger.warning(
+                "CIK %s: no report_date on the newest candidate filing manifest; "
+                "falling back to the latest filing %s",
+                cik,
+                accession,
+            )
+            group = [
+                OverrideTarget(
+                    cik=cik,
+                    accession_number=accession,
+                    form_type=form_type,
+                    filing_date=filing_date,
+                    report_date="",
+                )
+            ]
+        return group
+
+    def _report_date(self, cik: str, accession: str, form_type: str, filing_date: str) -> str:
+        """Return a filing's report date from its manifest.json, or "" if unavailable.
+
+        Args:
+            cik: CIK as stored in the bucket manifest (S3 keys use this form).
+            accession: SEC accession number.
+            form_type: SEC form type.
+            filing_date: ISO filing date.
+
+        Returns:
+            ISO report date, or an empty string when the manifest is missing,
+            unreadable, or predates the report_date field.
+        """
+        try:
+            filing = get_filing(
+                form_type,
+                datetime.date.fromisoformat(filing_date),
+                cik,
+                accession,
+                bucket=self.config.sec_bucket,
+            )
+        except Exception:
+            self.logger.exception("Failed to read filing manifest for %s", accession)
+            return ""
+        return filing.report_date if filing else ""
 
     def _existing_output_keys(self) -> frozenset[tuple[str, str]]:
         """Return (normalized cik, accession) pairs already in the output parquet."""
@@ -308,17 +449,18 @@ class CompanyFactsPipeline(Pipeline):
             )
         )
 
-    def _report_disposition(self, cik: str, disposition: str) -> None:
-        """Record the outcome for a CIK in the override report; no-op otherwise.
+    def _report_disposition(self, cik: str, accession: str, disposition: str) -> None:
+        """Record the outcome for one filing in the override report; no-op otherwise.
 
         Args:
             cik: The filing's CIK, padded or not.
+            accession: The filing's accession number.
             disposition: Outcome label, e.g. ``processed`` or ``failed(<type>)``.
         """
         if not self.cik_report:
             return
         with self._report_lock:
-            summary = self.cik_report.get(normalize_cik(cik))
+            summary = self.cik_report.get((normalize_cik(cik), accession))
             if summary is not None:
                 summary.disposition = disposition
 
@@ -370,23 +512,35 @@ class CompanyFactsPipeline(Pipeline):
                 scraped_filing.accession_number,
             ) in existing:
                 self.stats.increment("skipped_filings")
-                self._report_disposition(scraped_filing.cik, "already_in_output")
+                self._report_disposition(
+                    scraped_filing.cik, scraped_filing.accession_number, "already_in_output"
+                )
                 continue  # resume: already extracted on a previous run
 
-            if scraped_filing.failure_reason:
-                self.stats.increment("failed_filings")
-                self._report_disposition(scraped_filing.cik, "failed(upstream_scraper_failure)")
-                continue  # scraper-side failure — nothing actionable on our end
-
+            # failure_reason is checked against the documents rather than on its
+            # own: the scraper does not always clear it after a later successful
+            # re-scrape, so a filing can carry a stale reason alongside a primary
+            # document that is present in S3 and perfectly extractable.
             doc = self._select_primary_document(scraped_filing)
+
             if doc is None:
+                if scraped_filing.failure_reason:
+                    self.stats.increment("failed_filings")
+                    self._report_disposition(
+                        scraped_filing.cik,
+                        scraped_filing.accession_number,
+                        "failed(upstream_scraper_failure)",
+                    )
+                    continue  # scraper-side failure — nothing actionable on our end
                 self.stats.increment("failed_primary_docs")
                 self.failures.add(
                     (scraped_filing.cik, scraped_filing.accession_number),
                     FailureType.MISSING_DOCUMENT,
                 )
                 self._report_disposition(
-                    scraped_filing.cik, f"failed({FailureType.MISSING_DOCUMENT})"
+                    scraped_filing.cik,
+                    scraped_filing.accession_number,
+                    f"failed({FailureType.MISSING_DOCUMENT})",
                 )
                 continue
 
@@ -509,7 +663,9 @@ class CompanyFactsPipeline(Pipeline):
             if not html_bytes:
                 self.failures.add((filing.cik, filing.accession_number), FailureType.EMPTY_DOCUMENT)
                 self.stats.increment("storage_errors")
-                self._report_disposition(filing.cik, f"failed({FailureType.EMPTY_DOCUMENT})")
+                self._report_disposition(
+                    filing.cik, filing.accession_number, f"failed({FailureType.EMPTY_DOCUMENT})"
+                )
                 return []
             self.stats.increment("documents_fetched")
             doc = InlineXbrlDocument(html_bytes)
@@ -543,27 +699,35 @@ class CompanyFactsPipeline(Pipeline):
                     )
             self.stats.increment("extracted_documents", len(records))
             if records:
-                self._report_disposition(filing.cik, "processed")
+                self._report_disposition(filing.cik, filing.accession_number, "processed")
             elif extraction_failures:
-                self._report_disposition(filing.cik, f"failed({extraction_failures[0]})")
+                self._report_disposition(
+                    filing.cik, filing.accession_number, f"failed({extraction_failures[0]})"
+                )
             else:
-                self._report_disposition(filing.cik, "failed(no_records)")
+                self._report_disposition(filing.cik, filing.accession_number, "failed(no_records)")
             return records
         except NotInlineXbrlError:
             self.failures.add((filing.cik, filing.accession_number), FailureType.NO_INLINE_XBRL)
             self.stats.increment("parse_failures")
-            self._report_disposition(filing.cik, f"failed({FailureType.NO_INLINE_XBRL})")
+            self._report_disposition(
+                filing.cik, filing.accession_number, f"failed({FailureType.NO_INLINE_XBRL})"
+            )
             return []
         except XbrlParseError:
             self.failures.add((filing.cik, filing.accession_number), FailureType.MALFORMED_XBRL)
             self.stats.increment("parse_failures")
-            self._report_disposition(filing.cik, f"failed({FailureType.MALFORMED_XBRL})")
+            self._report_disposition(
+                filing.cik, filing.accession_number, f"failed({FailureType.MALFORMED_XBRL})"
+            )
             return []
         except Exception:
             self.logger.exception("Unexpected error processing %s", filing.accession_number)
             self.failures.add((filing.cik, filing.accession_number), FailureType.STORAGE_ERROR)
             self.stats.increment("storage_errors")
-            self._report_disposition(filing.cik, f"failed({FailureType.STORAGE_ERROR})")
+            self._report_disposition(
+                filing.cik, filing.accession_number, f"failed({FailureType.STORAGE_ERROR})"
+            )
             return []
 
     def save_output(self, processed_list: list[CompanyFactsRecord]) -> None:
@@ -634,16 +798,20 @@ class CompanyFactsPipeline(Pipeline):
         self._display_cik_report()
 
     def _display_cik_report(self) -> None:
-        """Log the per-CIK summary table for a --ciks-override run; no-op otherwise."""
+        """Log the per-filing summary table for a --ciks-override run; no-op otherwise."""
         if not self.cik_report:
             return
-        self.logger.info("CIK Override Report (%d CIKs)", len(self.cik_report))
+        ciks = {summary.cik for summary in self.cik_report.values()}
+        self.logger.info(
+            "CIK Override Report (%d CIKs, %d filings)", len(ciks), len(self.cik_report)
+        )
         self.logger.info("=" * 40)
         for summary in self.cik_report.values():
             self.logger.info(
-                "  %-12s %-10s %-12s %-22s %s",
+                "  %-12s %-10s %-12s %-12s %-22s %s",
                 summary.cik,
                 summary.form_type or "-",
+                summary.report_date or "-",
                 summary.filing_date or "-",
                 summary.accession_number or "-",
                 summary.disposition,

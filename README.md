@@ -63,7 +63,7 @@ required:
   --sec-bucket BUCKET       S3 bucket name for the SEC scraper data
   --output-file PATH        s3:// path for output parquet
   --failure-file PATH       s3:// path for failure registry
-  --daily | --start-date YYYY-MM-DD
+  --daily | --start-date YYYY-MM-DD | --ciks-override PATH
 
 optional:
   --end-date YYYY-MM-DD     required with --start-date
@@ -71,6 +71,18 @@ optional:
   --failure-flush-every N   flush failures every N items (default: 50)
   --num-workers N           parallel fetch workers (default: 10)
 ```
+
+`--ciks-override PATH` reads a file of CIKs (one per line, `#` comments
+allowed) and backfills those companies instead of scanning a date window. For
+each CIK it selects every scraped 10-K/20-F sharing that CIK's most recent
+report date — the annual report *and* any amendments of the same period — so
+downstream consumers can merge fields across a 10-K and its 10-K/A (an
+amendment usually re-tags the cover page but not the financial statements).
+Report dates come from each filing's `manifest.json`; candidates are walked
+newest-filed-first and the walk stops as soon as no older filing could match,
+so it costs a couple of extra reads per CIK. Filings already present in the
+output parquet are skipped, and the run ends with a per-filing disposition
+report. `--ciks-override` cannot be combined with `--end-date` or `--look-back`.
 
 ## CI/CD
 

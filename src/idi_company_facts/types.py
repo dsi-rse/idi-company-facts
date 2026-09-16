@@ -92,13 +92,34 @@ class PipelineConfig:
     ciks: tuple[str, ...] | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class OverrideTarget:
+    """One filing selected by --ciks-override, resolved from the SEC manifest.
+
+    A CIK resolves to every target filing sharing its most recent report date
+    (the original annual report plus any amendments of the same period), so the
+    downstream field-level merge across a 10-K and its 10-K/A has every input.
+    """
+
+    cik: str  # as stored in the manifest (may be zero-padded)
+    accession_number: str
+    form_type: str
+    filing_date: str  # ISO YYYY-MM-DD
+    report_date: str  # ISO YYYY-MM-DD; "" when the filing manifest omits it
+
+
 @dataclass
 class CikOverrideSummary:
-    """Per-CIK outcome of a --ciks-override run, for the end-of-run report."""
+    """Per-filing outcome of a --ciks-override run, for the end-of-run report.
+
+    One entry per selected filing; a CIK with no target filing in the manifest
+    gets a single entry with an empty accession number.
+    """
 
     cik: str  # normalized (no leading zeros)
     form_type: str = ""
     filing_date: str = ""  # ISO YYYY-MM-DD, as stored in the manifest
+    report_date: str = ""  # ISO YYYY-MM-DD, from the filing manifest
     accession_number: str = ""
     disposition: str = "pending"
 

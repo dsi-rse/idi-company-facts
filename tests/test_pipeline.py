@@ -170,7 +170,7 @@ class TestLoadInput:
     def test_skips_upstream_failures(
         self, pipeline: CompanyFactsPipeline, mocker: MockerFixture
     ) -> None:
-        """Manifests with a non-empty failure_reason are skipped; no failure recorded."""
+        """A failure_reason with no primary document is skipped; no failure recorded."""
         failing = make_manifest(failure_reason="scraper timed out", documents=[])
         mocker.patch(
             "idi_company_facts.pipeline.iter_filings_by_form_type", return_value=iter([failing])
@@ -181,6 +181,52 @@ class TestLoadInput:
         assert len(filings) == 0
         assert pipeline.stats.total_filings == 1
         assert pipeline.stats.failed_filings == 1
+        assert pipeline.stats.failed_primary_docs == 0
+        assert (failing.cik, failing.accession_number) not in pipeline.failures
+
+    def test_failure_reason_with_primary_doc_is_processed(
+        self, pipeline: CompanyFactsPipeline, mocker: MockerFixture
+    ) -> None:
+        """A failure_reason left over from an earlier attempt does not skip the filing.
+
+        The scraper does not always clear failure_reason after a later
+        successful re-scrape, so a filing can carry a stale reason alongside a
+        primary document that is present in S3 (observed on TotalEnergies'
+        FY2025 20-F, accession 0001104659-26-035876).
+        """
+        stale = make_manifest(
+            failure_reason="documents_missing",
+            documents=[make_doc(s3_key="s3://bucket/sec/tot-20251231x20f.htm")],
+        )
+        mocker.patch(
+            "idi_company_facts.pipeline.iter_filings_by_form_type", return_value=iter([stale])
+        )
+
+        filings = pipeline.load_input()
+
+        assert len(filings) == 1
+        assert filings[0].primary_s3_key == "s3://bucket/sec/tot-20251231x20f.htm"
+        assert pipeline.stats.failed_filings == 0
+        assert pipeline.stats.failed_primary_docs == 0
+        assert (stale.cik, stale.accession_number) not in pipeline.failures
+
+    def test_failure_reason_with_only_non_primary_docs_is_an_upstream_failure(
+        self, pipeline: CompanyFactsPipeline, mocker: MockerFixture
+    ) -> None:
+        """A failure_reason still wins when no document matches the primary type."""
+        failing = make_manifest(
+            failure_reason="documents_missing",
+            documents=[make_doc(doc_type="EX-21.1")],
+        )
+        mocker.patch(
+            "idi_company_facts.pipeline.iter_filings_by_form_type", return_value=iter([failing])
+        )
+
+        filings = pipeline.load_input()
+
+        assert len(filings) == 0
+        assert pipeline.stats.failed_filings == 1
+        # MISSING_DOCUMENT is reserved for filings the scraper considered clean.
         assert pipeline.stats.failed_primary_docs == 0
         assert (failing.cik, failing.accession_number) not in pipeline.failures
 
@@ -313,43 +359,71 @@ class TestLoadInput:
 # ---------------------------------------------------------------------------
 
 
-def make_manifest_parquet(rows: list[tuple[str, str, str, str]]) -> bytes:
-    """Serialize (form_type, filing_date, cik, accession_number) rows to parquet bytes."""
-    df = pd.DataFrame(rows, columns=["form_type", "filing_date", "cik", "accession_number"])
+def make_manifest_parquet(rows: list[tuple[str, str, str, str, str]]) -> bytes:
+    """Serialize (form_type, filing_date, cik, accession_number) rows to parquet bytes.
+
+    Rows carry a trailing report_date for the fake ``get_filing``; the bucket
+    manifest itself has no report_date column, so it is dropped here.
+    """
+    df = pd.DataFrame(
+        [row[:4] for row in rows],
+        columns=["form_type", "filing_date", "cik", "accession_number"],
+    )
     buf = io.BytesIO()
     df.to_parquet(buf, index=False)
     return buf.getvalue()
 
 
 class TestCiksOverride:
-    """Tests for latest-per-CIK selection and the override summary report."""
+    """Tests for latest-report-date-group selection and the override summary report."""
 
     def _override_pipeline(
         self,
         config: PipelineConfig,
         mocker: MockerFixture,
-        manifest_rows: list[tuple[str, str, str, str]],
+        manifest_rows: list[tuple[str, str, str, str, str]],
         ciks: tuple[str, ...],
     ) -> CompanyFactsPipeline:
-        """Return a pipeline in override mode with a synthetic manifest parquet."""
+        """Return a pipeline in override mode with a synthetic manifest parquet.
+
+        ``manifest_rows`` are (form_type, filing_date, cik, accession_number,
+        report_date); the report date is served by a fake ``get_filing``, standing
+        in for the filing's manifest.json.
+        """
         config.ciks = ciks
         manifest = make_manifest_parquet(manifest_rows)
+        report_dates = {row[3]: row[4] for row in manifest_rows}
 
         def fake_load_content(path: str) -> bytes:
             if path.endswith("manifest.parquet"):
                 return manifest
             return Path(path).read_bytes() if Path(path).exists() else b""
 
+        def fake_get_filing(
+            form_type: str, filing_date: date, cik: str, accession_number: str, **_: object
+        ) -> ScrapedFiling | None:
+            report_date = report_dates.get(accession_number)
+            if report_date is None:
+                return None
+            return make_manifest(
+                cik=cik,
+                accession_number=accession_number,
+                form_type=form_type,
+                filing_date=filing_date.isoformat(),
+                report_date=report_date,
+            )
+
         mocker.patch("idi_company_facts.pipeline.load_content", side_effect=fake_load_content)
+        mocker.patch("idi_company_facts.pipeline.get_filing", side_effect=fake_get_filing)
         return CompanyFactsPipeline(config)
 
-    def test_selects_latest_target_filing_per_cik(
+    def test_selects_latest_report_date_filing_per_cik(
         self, config: PipelineConfig, mocker: MockerFixture
     ) -> None:
-        """The max-filing_date target filing is selected; older ones are ignored."""
+        """The filing with the max report date is selected; older periods are ignored."""
         rows = [
-            ("10-K", "2023-03-01", "123", "0000000123-23-000001"),
-            ("10-K", "2024-03-01", "123", "0000000123-24-000001"),
+            ("10-K", "2023-03-01", "123", "0000000123-23-000001", "2022-12-31"),
+            ("10-K", "2024-03-01", "123", "0000000123-24-000001", "2023-12-31"),
         ]
         pipeline = self._override_pipeline(config, mocker, rows, ciks=("123",))
         latest = make_manifest(
@@ -367,11 +441,174 @@ class TestCiksOverride:
         assert mock_iter.call_args.kwargs["start_date"] == date(2024, 3, 1)
         assert mock_iter.call_args.kwargs["end_date"] == date(2024, 3, 1)
 
+    def test_amendment_and_original_of_same_period_are_both_selected(
+        self, config: PipelineConfig, mocker: MockerFixture
+    ) -> None:
+        """A 10-K/A and the 10-K it amends share a report date, so both are collected."""
+        rows = [
+            ("10-K", "2024-03-01", "123", "0000000123-24-000001", "2023-12-31"),
+            ("10-K", "2025-03-01", "123", "0000000123-25-000001", "2024-12-31"),
+            ("10-K/A", "2025-06-01", "123", "0000000123-25-000002", "2024-12-31"),
+        ]
+        pipeline = self._override_pipeline(config, mocker, rows, ciks=("123",))
+        original = make_manifest(
+            cik="123", accession_number="0000000123-25-000001", filing_date="2025-03-01"
+        )
+        amendment = make_manifest(
+            cik="123",
+            accession_number="0000000123-25-000002",
+            filing_date="2025-06-01",
+            form_type="10-K/A",
+        )
+        mock_iter = mocker.patch(
+            "idi_company_facts.pipeline.iter_filings_by_form_type",
+            side_effect=[iter([original]), iter([amendment])],
+        )
+
+        filings = pipeline.load_input()
+
+        assert sorted(f.accession_number for f in filings) == [
+            "0000000123-25-000001",
+            "0000000123-25-000002",
+        ]
+        # One manifest query per distinct filing date, oldest first.
+        assert [c.kwargs["start_date"] for c in mock_iter.call_args_list] == [
+            date(2025, 3, 1),
+            date(2025, 6, 1),
+        ]
+
+    def test_foreign_filer_amendment_is_grouped_the_same_way(
+        self, config: PipelineConfig, mocker: MockerFixture
+    ) -> None:
+        """Grouping is on report date alone, so a 20-F/A pairs with its 20-F."""
+        rows = [
+            ("20-F", "2025-04-01", "123", "0000000123-25-000001", "2024-12-31"),
+            ("20-F/A", "2025-07-01", "123", "0000000123-25-000002", "2024-12-31"),
+        ]
+        pipeline = self._override_pipeline(config, mocker, rows, ciks=("123",))
+        original = make_manifest(
+            cik="123",
+            accession_number="0000000123-25-000001",
+            filing_date="2025-04-01",
+            form_type="20-F",
+            documents=[make_doc(doc_type="20-F")],
+        )
+        amendment = make_manifest(
+            cik="123",
+            accession_number="0000000123-25-000002",
+            filing_date="2025-07-01",
+            form_type="20-F/A",
+            documents=[make_doc(doc_type="20-F")],
+        )
+        mocker.patch(
+            "idi_company_facts.pipeline.iter_filings_by_form_type",
+            side_effect=[iter([original]), iter([amendment])],
+        )
+
+        filings = pipeline.load_input()
+
+        assert sorted(f.accession_number for f in filings) == [
+            "0000000123-25-000001",
+            "0000000123-25-000002",
+        ]
+
+    def test_amendment_of_an_older_period_is_not_selected(
+        self, config: PipelineConfig, mocker: MockerFixture
+    ) -> None:
+        """The most recently *filed* filing loses to a newer report date filed earlier."""
+        rows = [
+            ("10-K", "2025-03-01", "123", "0000000123-25-000001", "2024-12-31"),
+            ("10-K/A", "2025-06-01", "123", "0000000123-25-000002", "2023-12-31"),
+        ]
+        pipeline = self._override_pipeline(config, mocker, rows, ciks=("123",))
+        original = make_manifest(
+            cik="123", accession_number="0000000123-25-000001", filing_date="2025-03-01"
+        )
+        mocker.patch(
+            "idi_company_facts.pipeline.iter_filings_by_form_type", return_value=iter([original])
+        )
+
+        filings = pipeline.load_input()
+
+        assert [f.accession_number for f in filings] == ["0000000123-25-000001"]
+
+    def test_walk_stops_once_no_older_filing_can_match(
+        self, config: PipelineConfig, mocker: MockerFixture
+    ) -> None:
+        """Filings filed before the best report date are never read."""
+        rows = [
+            ("10-K", "2025-03-01", "123", "0000000123-25-000001", "2024-12-31"),
+            ("10-K", "2024-03-01", "123", "0000000123-24-000001", "2023-12-31"),
+            ("10-K", "2023-03-01", "123", "0000000123-23-000001", "2022-12-31"),
+        ]
+        pipeline = self._override_pipeline(config, mocker, rows, ciks=("123",))
+        mock_get = mocker.patch(
+            "idi_company_facts.pipeline.get_filing",
+            side_effect=lambda form_type, filing_date, cik, accession_number, **_: make_manifest(
+                cik=cik,
+                accession_number=accession_number,
+                filing_date=filing_date.isoformat(),
+                report_date={row[3]: row[4] for row in rows}[accession_number],
+            ),
+        )
+        mocker.patch("idi_company_facts.pipeline.iter_filings_by_form_type", return_value=iter([]))
+
+        pipeline.load_input()
+
+        # The 2024-03-01 filing predates the 2024-12-31 report date, so the walk
+        # stops there and the 2024 and 2023 filings are never read.
+        assert mock_get.call_count == 1
+
+    def test_missing_report_dates_fall_back_to_latest_filing(
+        self, config: PipelineConfig, mocker: MockerFixture
+    ) -> None:
+        """With no report_date anywhere, only the most recently filed filing is used."""
+        rows = [
+            ("10-K", "2023-03-01", "123", "0000000123-23-000001", ""),
+            ("10-K", "2024-03-01", "123", "0000000123-24-000001", ""),
+        ]
+        pipeline = self._override_pipeline(config, mocker, rows, ciks=("123",))
+        latest = make_manifest(
+            cik="123", accession_number="0000000123-24-000001", filing_date="2024-03-01"
+        )
+        mocker.patch(
+            "idi_company_facts.pipeline.iter_filings_by_form_type", return_value=iter([latest])
+        )
+
+        filings = pipeline.load_input()
+
+        assert [f.accession_number for f in filings] == ["0000000123-24-000001"]
+
+    def test_newest_filing_without_report_date_wins_over_dated_older_filing(
+        self, config: PipelineConfig, mocker: MockerFixture
+    ) -> None:
+        """A newest filing lacking report_date is used, not an older filing that has one.
+
+        Pre-migration newest filing plus a re-scraped older one is a realistic state
+        after partial re-scrapes; the older period must not be processed instead.
+        """
+        rows = [
+            ("10-K", "2023-03-01", "123", "0000000123-23-000001", "2022-12-31"),
+            ("10-K", "2024-03-01", "123", "0000000123-24-000001", ""),
+        ]
+        pipeline = self._override_pipeline(config, mocker, rows, ciks=("123",))
+        latest = make_manifest(
+            cik="123", accession_number="0000000123-24-000001", filing_date="2024-03-01"
+        )
+        mock_iter = mocker.patch(
+            "idi_company_facts.pipeline.iter_filings_by_form_type", return_value=iter([latest])
+        )
+
+        filings = pipeline.load_input()
+
+        assert [f.accession_number for f in filings] == ["0000000123-24-000001"]
+        assert mock_iter.call_args.kwargs["start_date"] == date(2024, 3, 1)
+
     def test_zero_padded_request_matches_unpadded_manifest(
         self, config: PipelineConfig, mocker: MockerFixture
     ) -> None:
         """A zero-padded requested CIK resolves against the manifest's unpadded form."""
-        rows = [("10-K", "2024-03-01", "123", "0000000123-24-000001")]
+        rows = [("10-K", "2024-03-01", "123", "0000000123-24-000001", "2023-12-31")]
         pipeline = self._override_pipeline(config, mocker, rows, ciks=("0000000123",))
         latest = make_manifest(
             cik="123", accession_number="0000000123-24-000001", filing_date="2024-03-01"
@@ -383,13 +620,13 @@ class TestCiksOverride:
         filings = pipeline.load_input()
 
         assert len(filings) == 1
-        assert "123" in pipeline.cik_report
+        assert ("123", "0000000123-24-000001") in pipeline.cik_report
 
     def test_non_target_forms_report_no_target_filing(
         self, config: PipelineConfig, mocker: MockerFixture
     ) -> None:
         """A CIK with only non-target forms (e.g. 40-F) reports NO_TARGET_FILING_IN_MANIFEST."""
-        rows = [("40-F", "2024-03-01", "123", "0000000123-24-000001")]
+        rows = [("40-F", "2024-03-01", "123", "0000000123-24-000001", "2023-12-31")]
         pipeline = self._override_pipeline(config, mocker, rows, ciks=("123",))
         mock_iter = mocker.patch(
             "idi_company_facts.pipeline.iter_filings_by_form_type", return_value=iter([])
@@ -398,29 +635,29 @@ class TestCiksOverride:
         filings = pipeline.load_input()
 
         assert filings == []
-        assert pipeline.cik_report["123"].disposition == "NO_TARGET_FILING_IN_MANIFEST"
+        assert pipeline.cik_report[("123", "")].disposition == "NO_TARGET_FILING_IN_MANIFEST"
         mock_iter.assert_not_called()
 
     def test_cik_absent_from_manifest_reports_no_target_filing(
         self, config: PipelineConfig, mocker: MockerFixture
     ) -> None:
         """A CIK with no manifest rows at all reports NO_TARGET_FILING_IN_MANIFEST."""
-        rows = [("10-K", "2024-03-01", "999", "0000000999-24-000001")]
+        rows = [("10-K", "2024-03-01", "999", "0000000999-24-000001", "2023-12-31")]
         pipeline = self._override_pipeline(config, mocker, rows, ciks=("123",))
         mocker.patch("idi_company_facts.pipeline.iter_filings_by_form_type", return_value=iter([]))
 
         pipeline.load_input()
 
-        assert pipeline.cik_report["123"].disposition == "NO_TARGET_FILING_IN_MANIFEST"
+        assert pipeline.cik_report[("123", "")].disposition == "NO_TARGET_FILING_IN_MANIFEST"
 
     def test_filing_already_in_output_is_skipped(
         self, config: PipelineConfig, mocker: MockerFixture
     ) -> None:
-        """A latest filing already present in the output parquet is not reprocessed."""
+        """A selected filing already present in the output parquet is not reprocessed."""
         pd.DataFrame(
             {"company_cik": ["0000000123"], "accession_number": ["0000000123-24-000001"]}
         ).to_parquet(config.output_file, index=False)
-        rows = [("10-K", "2024-03-01", "123", "0000000123-24-000001")]
+        rows = [("10-K", "2024-03-01", "123", "0000000123-24-000001", "2023-12-31")]
         pipeline = self._override_pipeline(config, mocker, rows, ciks=("123",))
         mock_iter = mocker.patch(
             "idi_company_facts.pipeline.iter_filings_by_form_type", return_value=iter([])
@@ -429,14 +666,42 @@ class TestCiksOverride:
         filings = pipeline.load_input()
 
         assert filings == []
-        assert pipeline.cik_report["123"].disposition == "already_in_output"
+        assert pipeline.cik_report[("123", "0000000123-24-000001")].disposition == (
+            "already_in_output"
+        )
         mock_iter.assert_not_called()
+
+    def test_amendment_in_output_does_not_block_its_original(
+        self, config: PipelineConfig, mocker: MockerFixture
+    ) -> None:
+        """Resume is per filing: only the accession already in the output is skipped."""
+        pd.DataFrame(
+            {"company_cik": ["123"], "accession_number": ["0000000123-25-000002"]}
+        ).to_parquet(config.output_file, index=False)
+        rows = [
+            ("10-K", "2025-03-01", "123", "0000000123-25-000001", "2024-12-31"),
+            ("10-K/A", "2025-06-01", "123", "0000000123-25-000002", "2024-12-31"),
+        ]
+        pipeline = self._override_pipeline(config, mocker, rows, ciks=("123",))
+        original = make_manifest(
+            cik="123", accession_number="0000000123-25-000001", filing_date="2025-03-01"
+        )
+        mocker.patch(
+            "idi_company_facts.pipeline.iter_filings_by_form_type", return_value=iter([original])
+        )
+
+        filings = pipeline.load_input()
+
+        assert [f.accession_number for f in filings] == ["0000000123-25-000001"]
+        assert pipeline.cik_report[("123", "0000000123-25-000002")].disposition == (
+            "already_in_output"
+        )
 
     def test_process_one_reports_processed_disposition(
         self, config: PipelineConfig, mocker: MockerFixture
     ) -> None:
-        """A successfully extracted filing flips its CIK's disposition to processed."""
-        rows = [("10-K", "2024-03-01", "1234567", "0001234567-24-000001")]
+        """A successfully extracted filing flips its own disposition to processed."""
+        rows = [("10-K", "2024-03-01", "1234567", "0001234567-24-000001", "2023-12-31")]
         pipeline = self._override_pipeline(config, mocker, rows, ciks=("1234567",))
         latest = make_manifest(
             cik="1234567", accession_number="0001234567-24-000001", filing_date="2024-03-01"
@@ -454,13 +719,13 @@ class TestCiksOverride:
         mocker.patch("idi_company_facts.pipeline.load_content", return_value=b"dummy")
         pipeline._process_one(filings[0])
 
-        assert pipeline.cik_report["1234567"].disposition == "processed"
+        assert pipeline.cik_report[("1234567", "0001234567-24-000001")].disposition == "processed"
 
     def test_process_one_reports_failed_disposition(
         self, config: PipelineConfig, mocker: MockerFixture
     ) -> None:
-        """An empty primary document reports failed(empty_document) for its CIK."""
-        rows = [("10-K", "2024-03-01", "1234567", "0001234567-24-000001")]
+        """An empty primary document reports failed(empty_document) for that filing."""
+        rows = [("10-K", "2024-03-01", "1234567", "0001234567-24-000001", "2023-12-31")]
         pipeline = self._override_pipeline(config, mocker, rows, ciks=("1234567",))
         latest = make_manifest(
             cik="1234567", accession_number="0001234567-24-000001", filing_date="2024-03-01"
@@ -473,13 +738,15 @@ class TestCiksOverride:
         # fake_load_content returns b"" for the (nonexistent) primary document path
         pipeline._process_one(filings[0])
 
-        assert pipeline.cik_report["1234567"].disposition == "failed(empty_document)"
+        assert pipeline.cik_report[("1234567", "0001234567-24-000001")].disposition == (
+            "failed(empty_document)"
+        )
 
     def test_display_stats_logs_cik_report(
         self, config: PipelineConfig, mocker: MockerFixture
     ) -> None:
-        """The override report table is logged with per-CIK dispositions."""
-        rows = [("40-F", "2024-03-01", "123", "0000000123-24-000001")]
+        """The override report table is logged with per-filing dispositions."""
+        rows = [("40-F", "2024-03-01", "123", "0000000123-24-000001", "2023-12-31")]
         pipeline = self._override_pipeline(config, mocker, rows, ciks=("123",))
         mocker.patch("idi_company_facts.pipeline.iter_filings_by_form_type", return_value=iter([]))
         pipeline.load_input()

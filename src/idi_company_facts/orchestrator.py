@@ -146,7 +146,9 @@ def get_args() -> argparse.Namespace:
         metavar="PATH",
         help=(
             "Local or s3:// file of CIKs (one per line, '#' comments allowed); "
-            "process each CIK's most recent scraped target filing instead of a date window"
+            "process each CIK's most recent scraped report period — the annual "
+            "report plus any amendments sharing its report date — instead of a "
+            "date window"
         ),
     )
 
