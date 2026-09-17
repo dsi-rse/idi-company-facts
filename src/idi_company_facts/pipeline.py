@@ -730,11 +730,10 @@ class CompanyFactsPipeline(Pipeline):
     def save_output(self, processed_list: list[CompanyFactsRecord]) -> None:
         """Merge extracted records into the output parquet file.
 
-        The output accumulates across runs (corporate-structure pattern): new
-        rows are merged with any existing parquet and deduplicated on
-        (company_cik, accession_number), with this run's rows winning on key
-        collisions. load_input skips accessions already in the output, so
-        collisions only occur on deliberate reruns.
+        The output accumulates across runs: new rows are merged with any existing parquet
+        and deduplicated on (company_cik, accession_number), with this run's rows winning on key
+        collisions. load_input skips accessions already in the output, so collisions only occur on
+        deliberate reruns.
 
         Args:
             processed_list: Records returned by :meth:`process`.
@@ -743,9 +742,7 @@ class CompanyFactsPipeline(Pipeline):
             self.logger.info("no records extracted; skipping output write")
             return
         df = pd.DataFrame([asdict(r) for r in processed_list])
-        # Flatten the securities list into parallel pipe-delimited columns —
-        # entry i of each column describes the same security, common stock first.
-        # Empty slots are preserved so the columns stay index-aligned.
+        # Flatten the securities list into aligned, parallel pipe-delimited columns
         securities = df.pop("registered_securities")
         df["all_security_names"] = securities.map(
             lambda secs: " | ".join(s["security_name"] for s in secs)

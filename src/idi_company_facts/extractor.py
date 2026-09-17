@@ -117,6 +117,7 @@ class CompanyFactsExtractor:
 
         failures: list[FailureType] = []
         if period_end is None:
+            # No period_end to anchor the revenue concept
             failures.append(FailureType.MISSING_PERIOD_END)
         elif revenue is None:
             failures.append(FailureType.NO_REVENUE_CONCEPT)
@@ -150,7 +151,12 @@ class CompanyFactsExtractor:
         return record, failures, n_unmatched_explicit, n_unmatched_typed
 
     def _period_end(self, doc: InlineXbrlDocument) -> datetime.date | None:
-        """Return DocumentPeriodEndDate as a date, or None if absent or unparseable."""
+        """Return DocumentPeriodEndDate as a date, or None if absent or unparseable.
+
+        Some filers omit the format= attribute on dei:DocumentPeriodEndDate, so
+        the parser returns the raw text string instead of a datetime.date.  Try
+        parse_date_text as a fallback so those filings still anchor correctly.
+        """
         fact = doc.single_fact(PERIOD_END)
         if fact is None:
             return None
@@ -401,9 +407,11 @@ class CompanyFactsExtractor:
                         slot = typed_dim_groups.setdefault(typed_dims, {})
                 else:
                     slot = dimless_groups.setdefault(ctx.context_id, {})
+                # Keep the first value per concept within a group.
                 slot.setdefault(concept, str(f.value))
 
         # Merge dimensionless contexts when they don't conflict.
+        # typically, each fact within a 12b security row are tagged with the same context ID.
         if dimless_groups:
             conflicting = any(
                 len({" ".join(slot[c].split()) for slot in dimless_groups.values() if c in slot})
@@ -478,6 +486,10 @@ class CompanyFactsExtractor:
         no ticker) are kept as separate rows rather than collapsed.
 
         When duplicates do collide each field takes the first non-empty value.
+
+        This function is applied to explicit entries only; typed entries are
+        already keyed by unique dimension sets in _registered_securities and
+        do not need deduplication.
         """
         by_key: dict[tuple, tuple[frozenset[Dimension], RegisteredSecurity]] = {}
         for dimensions, sec in entries:
@@ -529,6 +541,7 @@ class CompanyFactsExtractor:
         if period_end is None:
             return None, None, None, False
 
+        # Collect the first qualifying fact per concept in priority order
         concept_hits: list[tuple[Decimal, datetime.date, str | None]] = []
         for concept in REVENUE_CONCEPTS:
             for fact in doc.facts(concept):
