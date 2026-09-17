@@ -818,8 +818,13 @@ class TestAttributionCases:
         assert " | " not in appended[0].dimensioned_members
         assert appended[0].shares_outstanding == "77777"
 
-    def test_alignment_invariant(self, extractor: CompanyFactsExtractor) -> None:
-        # All securities lists have equal lengths regardless of mix.
+    def test_registered_securities_row_order_and_content(
+        self, extractor: CompanyFactsExtractor
+    ) -> None:
+        # 3g: replaces test_alignment_invariant.  Same fixture — one dimensionless
+        # ticker (TICK) and one dimensional ticker (CLA, CommonClassAMember) with a
+        # matching shares count of 100 — but assertions are now concrete and complete
+        # for every field on every row, so a mutation that returns [] fails.
         class_a_dei = """
         <xbrli:context id="c-dei-a">
           <xbrli:entity>
@@ -846,17 +851,139 @@ class TestAttributionCases:
             )
         )
         _, _, securities, *_ = extractor._shares_and_securities(doc)
-        # All per-security attributes must have equal count.
-        fields = [
-            [s.security_name for s in securities],
-            [s.ticker for s in securities],
-            [s.exchange for s in securities],
-            [s.dimensioned_members for s in securities],
-            [s.shares_outstanding for s in securities],
-            [s.shares_outstanding_as_of for s in securities],
-        ]
-        lengths = [len(f) for f in fields]
-        assert len(set(lengths)) == 1, f"alignment broken: {lengths}"
+        # Row 0: dimensionless TICK — no shares slot (scalar carries the count).
+        # Row 1: dimensional CLA (CommonClassAMember) — 100 shares attributed.
+        assert len(securities) == 2
+        assert (
+            securities[0].security_name,
+            securities[0].ticker,
+            securities[0].exchange,
+            securities[0].dimensioned_members,
+            securities[0].shares_outstanding,
+            securities[0].shares_outstanding_as_of,
+        ) == ("", "TICK", "", "", "", None)
+        assert (
+            securities[1].security_name,
+            securities[1].ticker,
+            securities[1].exchange,
+            securities[1].dimensioned_members,
+            securities[1].shares_outstanding,
+            securities[1].shares_outstanding_as_of,
+        ) == (
+            "",
+            "CLA",
+            "",
+            "us-gaap:StatementClassOfStockAxis=us-gaap:CommonClassAMember",
+            "100",
+            datetime.date(2024, 9, 28),
+        )
+
+    def test_latest_date_wins_within_dimensioned_group(
+        self, extractor: CompanyFactsExtractor
+    ) -> None:
+        # 3d: Two EntityCommonStockSharesOutstanding facts share the SAME class-axis
+        # dimension pair-set but carry different instant dates (2024-06-30 value=100,
+        # 2024-09-28 value=200).  _best must pick the most recent → shares_outstanding="200".
+        class_a_early_ctx = """
+        <xbrli:context id="c-class-a-early">
+          <xbrli:entity>
+            <xbrli:identifier scheme="http://www.sec.gov/CIK">0001234567</xbrli:identifier>
+            <xbrli:segment>
+              <xbrldi:explicitMember dimension="us-gaap:StatementClassOfStockAxis">us-gaap:CommonClassAMember</xbrldi:explicitMember>
+            </xbrli:segment>
+          </xbrli:entity>
+          <xbrli:period><xbrli:instant>2024-06-30</xbrli:instant></xbrli:period>
+        </xbrli:context>"""
+        class_a_dei_ctx = """
+        <xbrli:context id="c-class-a-dei">
+          <xbrli:entity>
+            <xbrli:identifier scheme="http://www.sec.gov/CIK">0001234567</xbrli:identifier>
+            <xbrli:segment>
+              <xbrldi:explicitMember dimension="us-gaap:StatementClassOfStockAxis">us-gaap:CommonClassAMember</xbrldi:explicitMember>
+            </xbrli:segment>
+          </xbrli:entity>
+          <xbrli:period>
+            <xbrli:startDate>2023-09-30</xbrli:startDate>
+            <xbrli:endDate>2024-09-28</xbrli:endDate>
+          </xbrli:period>
+        </xbrli:context>"""
+        facts = (
+            # Early instant (2024-06-30), value 100.
+            '<p><ix:nonFraction name="dei:EntityCommonStockSharesOutstanding"'
+            ' contextRef="c-class-a-early" unitRef="shares" decimals="0">100</ix:nonFraction></p>'
+            # Late instant (2024-09-28), value 200 — reuses _CLASS_A_CTX (id="c-class-a").
+            '<p><ix:nonFraction name="dei:EntityCommonStockSharesOutstanding"'
+            ' contextRef="c-class-a" unitRef="shares" decimals="0">200</ix:nonFraction></p>'
+            '<p><ix:nonNumeric name="dei:TradingSymbol" contextRef="c-class-a-dei">CLA</ix:nonNumeric></p>'
+            '<p><ix:nonNumeric name="dei:SecurityExchangeName" contextRef="c-class-a-dei">NYSE</ix:nonNumeric></p>'
+            '<p><ix:nonNumeric name="dei:Security12bTitle" contextRef="c-class-a-dei">Class A Common Stock</ix:nonNumeric></p>'
+        )
+        doc = InlineXbrlDocument(
+            make_ixbrl_bytes(
+                contexts=_CLASS_A_CTX + class_a_early_ctx + class_a_dei_ctx,
+                units=_SHARES_UNIT,
+                facts=facts,
+            )
+        )
+        (
+            shares,
+            shares_date,
+            securities,
+            ambiguous_shares,
+            n_unmatched_explicit,
+            n_unmatched_typed,
+        ) = extractor._shares_and_securities(doc, "0000000000-00-000000")
+        assert len(securities) == 1
+        assert securities[0].shares_outstanding == "200"
+        assert securities[0].shares_outstanding_as_of == datetime.date(2024, 9, 28)
+        assert n_unmatched_explicit == 0
+
+    def test_duration_context_dimensioned_count_dropped(
+        self, extractor: CompanyFactsExtractor
+    ) -> None:
+        # 3e: An EntityCommonStockSharesOutstanding fact in a duration (non-instant) context
+        # with the class-axis dimension is silently dropped because as_of_date is None.
+        # The security row is still emitted with empty shares_outstanding; no stub is
+        # appended (n_unmatched_explicit stays 0).
+        class_a_dur_ctx = """
+        <xbrli:context id="c-class-a-dur">
+          <xbrli:entity>
+            <xbrli:identifier scheme="http://www.sec.gov/CIK">0001234567</xbrli:identifier>
+            <xbrli:segment>
+              <xbrldi:explicitMember dimension="us-gaap:StatementClassOfStockAxis">us-gaap:CommonClassAMember</xbrldi:explicitMember>
+            </xbrli:segment>
+          </xbrli:entity>
+          <xbrli:period>
+            <xbrli:startDate>2023-09-30</xbrli:startDate>
+            <xbrli:endDate>2024-09-28</xbrli:endDate>
+          </xbrli:period>
+        </xbrli:context>"""
+        facts = (
+            # Duration-context share count — as_of_date is None → must be dropped.
+            '<p><ix:nonFraction name="dei:EntityCommonStockSharesOutstanding"'
+            ' contextRef="c-class-a-dur" unitRef="shares" decimals="0">500</ix:nonFraction></p>'
+            '<p><ix:nonNumeric name="dei:TradingSymbol" contextRef="c-class-a-dur">CLA</ix:nonNumeric></p>'
+            '<p><ix:nonNumeric name="dei:SecurityExchangeName" contextRef="c-class-a-dur">NYSE</ix:nonNumeric></p>'
+            '<p><ix:nonNumeric name="dei:Security12bTitle" contextRef="c-class-a-dur">Class A Common Stock</ix:nonNumeric></p>'
+        )
+        doc = InlineXbrlDocument(
+            make_ixbrl_bytes(
+                contexts=class_a_dur_ctx,
+                units=_SHARES_UNIT,
+                facts=facts,
+            )
+        )
+        (
+            shares,
+            shares_date,
+            securities,
+            ambiguous_shares,
+            n_unmatched_explicit,
+            n_unmatched_typed,
+        ) = extractor._shares_and_securities(doc, "0000000000-00-000000")
+        assert len(securities) == 1
+        assert securities[0].shares_outstanding == ""
+        assert n_unmatched_explicit == 0
 
 
 # ── TestRegisteredSecurities ──────────────────────────────────────────────────
@@ -1071,7 +1198,6 @@ class TestRegisteredSecurities:
                 facts=facts,
             )
         )
-        _, shares_date, securities, *_ = extractor._shares_and_securities(doc)
         # No dimensionless shares fact → scalar is None.
         shares, _, securities, *_ = extractor._shares_and_securities(doc)
         assert shares is None
@@ -1105,6 +1231,46 @@ class TestRegisteredSecurities:
         members = {s.dimensioned_members for s in securities}
         assert "" in members
         assert "us-gaap:StatementClassOfStockAxis=us-gaap:AmericanDepositarySharesMember" in members
+
+    def test_dedupe_merges_conflicting_dimensionless_ticker_contexts(
+        self, extractor: CompanyFactsExtractor
+    ) -> None:
+        # 3f: ticker ABC appears in two dimensionless contexts that conflict on
+        # Security12bTitle ("Common Stock" vs "Common Shares"), so the pre-merge
+        # in _registered_securities is skipped.  Both entries reach _dedupe_securities
+        # under the same key ("ticker", "abc", frozenset()) and are merged there,
+        # with the first non-empty value winning for each field.
+        c1 = """
+        <xbrli:context id="c-abc-1">
+          <xbrli:entity><xbrli:identifier scheme="http://www.sec.gov/CIK">0001234567</xbrli:identifier></xbrli:entity>
+          <xbrli:period><xbrli:instant>2024-09-28</xbrli:instant></xbrli:period>
+        </xbrli:context>"""
+        c2 = """
+        <xbrli:context id="c-abc-2">
+          <xbrli:entity><xbrli:identifier scheme="http://www.sec.gov/CIK">0001234567</xbrli:identifier></xbrli:entity>
+          <xbrli:period>
+            <xbrli:startDate>2023-09-30</xbrli:startDate>
+            <xbrli:endDate>2024-09-28</xbrli:endDate>
+          </xbrli:period>
+        </xbrli:context>"""
+        facts = (
+            # c-abc-1: ticker + first title (no exchange)
+            '<p><ix:nonNumeric name="dei:TradingSymbol" contextRef="c-abc-1">ABC</ix:nonNumeric></p>'
+            '<p><ix:nonNumeric name="dei:Security12bTitle" contextRef="c-abc-1">Common Stock</ix:nonNumeric></p>'
+            # c-abc-2: ticker + exchange + conflicting title
+            '<p><ix:nonNumeric name="dei:TradingSymbol" contextRef="c-abc-2">ABC</ix:nonNumeric></p>'
+            '<p><ix:nonNumeric name="dei:SecurityExchangeName" contextRef="c-abc-2">NYSE</ix:nonNumeric></p>'
+            '<p><ix:nonNumeric name="dei:Security12bTitle" contextRef="c-abc-2">Common Shares</ix:nonNumeric></p>'
+        )
+        doc = InlineXbrlDocument(make_ixbrl_bytes(contexts=c1 + c2, facts=facts))
+        _, _, securities, *_ = extractor._shares_and_securities(doc)
+        # _dedupe_securities collapses both entries into one.
+        assert len(securities) == 1
+        assert securities[0].ticker == "ABC"
+        # Exchange comes from c-abc-2 (first non-empty).
+        assert securities[0].exchange == "NYSE"
+        # security_name comes from c-abc-1 (first non-empty).
+        assert securities[0].security_name == "Common Stock"
 
 
 # ── TestShellCompany ──────────────────────────────────────────────────────────
@@ -1784,3 +1950,209 @@ class TestA5UnjoinedCounters:
             n_unmatched_explicit == 2
         )  # class-axis and non-standard-axis both count as dimensioned
         assert n_unmatched_typed == 1
+
+
+# ── TestA3bTypedMemberMatching ─────────────────────────────────────────────────
+
+
+class TestA3bTypedMemberMatching:
+    """Tests 3a/3b/3c: typed-member securities matched against typed-member share counts."""
+
+    def test_3a_typed_security_matched_to_typed_share_count(
+        self, extractor: CompanyFactsExtractor
+    ) -> None:
+        # Test 3a: One typed security + one typed share count with identical axis/value.
+        # The typed share count must be attributed to the typed security, not become a stub.
+        typed_sec_ctx = """
+        <xbrli:context id="c-typed-sec" xmlns:acme="http://example.com/acme">
+          <xbrli:entity>
+            <xbrli:identifier scheme="http://www.sec.gov/CIK">0001234567</xbrli:identifier>
+            <xbrli:segment>
+              <xbrldi:typedMember dimension="acme:SomeAxis"><acme:Val>X</acme:Val></xbrldi:typedMember>
+            </xbrli:segment>
+          </xbrli:entity>
+          <xbrli:period>
+            <xbrli:startDate>2023-09-30</xbrli:startDate>
+            <xbrli:endDate>2024-09-28</xbrli:endDate>
+          </xbrli:period>
+        </xbrli:context>"""
+        typed_shares_ctx = """
+        <xbrli:context id="c-typed-shares" xmlns:acme="http://example.com/acme">
+          <xbrli:entity>
+            <xbrli:identifier scheme="http://www.sec.gov/CIK">0001234567</xbrli:identifier>
+            <xbrli:segment>
+              <xbrldi:typedMember dimension="acme:SomeAxis"><acme:Val>X</acme:Val></xbrldi:typedMember>
+            </xbrli:segment>
+          </xbrli:entity>
+          <xbrli:period><xbrli:instant>2024-09-28</xbrli:instant></xbrli:period>
+        </xbrli:context>"""
+        facts = (
+            '<p><ix:nonNumeric name="dei:TradingSymbol" contextRef="c-typed-sec">TYPED</ix:nonNumeric></p>'
+            '<p><ix:nonNumeric name="dei:Security12bTitle" contextRef="c-typed-sec">Typed Security</ix:nonNumeric></p>'
+            '<p><ix:nonFraction name="dei:EntityCommonStockSharesOutstanding" contextRef="c-typed-shares" unitRef="shares" decimals="0">1234567</ix:nonFraction></p>'
+        )
+        doc = InlineXbrlDocument(
+            make_ixbrl_bytes(
+                contexts=typed_sec_ctx + typed_shares_ctx,
+                units=_SHARES_UNIT,
+                facts=facts,
+            )
+        )
+        (
+            shares,
+            shares_date,
+            securities,
+            ambiguous_shares,
+            n_unmatched_explicit,
+            n_unmatched_typed,
+        ) = extractor._shares_and_securities(doc, "0000000000-00-000000")
+        # One typed security matched to its share count — no stub appended.
+        assert len(securities) == 1
+        assert securities[0].ticker != ""
+        assert securities[0].shares_outstanding != ""
+        assert securities[0].dimensioned_members == "acme:SomeAxis=X"
+        assert n_unmatched_typed == 0
+        assert n_unmatched_explicit == 0
+
+    def test_3b_typed_security_not_matched_different_value(
+        self, extractor: CompanyFactsExtractor
+    ) -> None:
+        # Test 3b: Same axis (acme:SomeAxis), but security has member "X" and share
+        # count has member "Y".  Different typed values → no match → stub appended.
+        typed_sec_ctx = """
+        <xbrli:context id="c-typed-sec-x" xmlns:acme="http://example.com/acme">
+          <xbrli:entity>
+            <xbrli:identifier scheme="http://www.sec.gov/CIK">0001234567</xbrli:identifier>
+            <xbrli:segment>
+              <xbrldi:typedMember dimension="acme:SomeAxis"><acme:Val>X</acme:Val></xbrldi:typedMember>
+            </xbrli:segment>
+          </xbrli:entity>
+          <xbrli:period>
+            <xbrli:startDate>2023-09-30</xbrli:startDate>
+            <xbrli:endDate>2024-09-28</xbrli:endDate>
+          </xbrli:period>
+        </xbrli:context>"""
+        typed_shares_ctx = """
+        <xbrli:context id="c-typed-shares-y" xmlns:acme="http://example.com/acme">
+          <xbrli:entity>
+            <xbrli:identifier scheme="http://www.sec.gov/CIK">0001234567</xbrli:identifier>
+            <xbrli:segment>
+              <xbrldi:typedMember dimension="acme:SomeAxis"><acme:Val>Y</acme:Val></xbrldi:typedMember>
+            </xbrli:segment>
+          </xbrli:entity>
+          <xbrli:period><xbrli:instant>2024-09-28</xbrli:instant></xbrli:period>
+        </xbrli:context>"""
+        facts = (
+            '<p><ix:nonNumeric name="dei:TradingSymbol" contextRef="c-typed-sec-x">TYPEDX</ix:nonNumeric></p>'
+            '<p><ix:nonNumeric name="dei:Security12bTitle" contextRef="c-typed-sec-x">Typed X Security</ix:nonNumeric></p>'
+            '<p><ix:nonFraction name="dei:EntityCommonStockSharesOutstanding" contextRef="c-typed-shares-y" unitRef="shares" decimals="0">9999999</ix:nonFraction></p>'
+        )
+        doc = InlineXbrlDocument(
+            make_ixbrl_bytes(
+                contexts=typed_sec_ctx + typed_shares_ctx,
+                units=_SHARES_UNIT,
+                facts=facts,
+            )
+        )
+        (
+            shares,
+            shares_date,
+            securities,
+            ambiguous_shares,
+            n_unmatched_explicit,
+            n_unmatched_typed,
+        ) = extractor._shares_and_securities(doc, "0000000000-00-000000")
+        # Security (value=X) cannot match share count (value=Y) → stub appended.
+        assert len(securities) == 2
+        assert securities[0].shares_outstanding == ""
+        assert securities[1].dimensioned_members == "acme:SomeAxis=Y"
+        assert securities[1].security_name == ""
+        assert n_unmatched_typed == 1
+
+    def test_3c_order_dimensionless_explicit_typed_stubs(
+        self, extractor: CompanyFactsExtractor
+    ) -> None:
+        # Test 3c: Mixed document with one dimensionless, one explicit, one typed security,
+        # and one unmatched explicit share count → 4 total rows in the correct order.
+        dimless_ctx = """
+        <xbrli:context id="c-dimless">
+          <xbrli:entity>
+            <xbrli:identifier scheme="http://www.sec.gov/CIK">0001234567</xbrli:identifier>
+          </xbrli:entity>
+          <xbrli:period>
+            <xbrli:startDate>2023-09-30</xbrli:startDate>
+            <xbrli:endDate>2024-09-28</xbrli:endDate>
+          </xbrli:period>
+        </xbrli:context>"""
+        explicit_sec_ctx = """
+        <xbrli:context id="c-class-a-sec">
+          <xbrli:entity>
+            <xbrli:identifier scheme="http://www.sec.gov/CIK">0001234567</xbrli:identifier>
+            <xbrli:segment>
+              <xbrldi:explicitMember dimension="us-gaap:StatementClassOfStockAxis">us-gaap:CommonClassAMember</xbrldi:explicitMember>
+            </xbrli:segment>
+          </xbrli:entity>
+          <xbrli:period>
+            <xbrli:startDate>2023-09-30</xbrli:startDate>
+            <xbrli:endDate>2024-09-28</xbrli:endDate>
+          </xbrli:period>
+        </xbrli:context>"""
+        typed_sec_ctx = """
+        <xbrli:context id="c-typed-z" xmlns:acme="http://example.com/acme">
+          <xbrli:entity>
+            <xbrli:identifier scheme="http://www.sec.gov/CIK">0001234567</xbrli:identifier>
+            <xbrli:segment>
+              <xbrldi:typedMember dimension="acme:SomeAxis"><acme:Val>Z</acme:Val></xbrldi:typedMember>
+            </xbrli:segment>
+          </xbrli:entity>
+          <xbrli:period>
+            <xbrli:startDate>2023-09-30</xbrli:startDate>
+            <xbrli:endDate>2024-09-28</xbrli:endDate>
+          </xbrli:period>
+        </xbrli:context>"""
+        # Unmatched explicit share count: ClassB member (no ClassB security registered)
+        unmatched_shares_ctx = """
+        <xbrli:context id="c-class-b-shares">
+          <xbrli:entity>
+            <xbrli:identifier scheme="http://www.sec.gov/CIK">0001234567</xbrli:identifier>
+            <xbrli:segment>
+              <xbrldi:explicitMember dimension="us-gaap:StatementClassOfStockAxis">us-gaap:CommonClassBMember</xbrldi:explicitMember>
+            </xbrli:segment>
+          </xbrli:entity>
+          <xbrli:period><xbrli:instant>2024-09-28</xbrli:instant></xbrli:period>
+        </xbrli:context>"""
+        facts = (
+            # Dimensionless security
+            '<p><ix:nonNumeric name="dei:TradingSymbol" contextRef="c-dimless">DIMLESS</ix:nonNumeric></p>'
+            '<p><ix:nonNumeric name="dei:SecurityExchangeName" contextRef="c-dimless">NYSE</ix:nonNumeric></p>'
+            # Explicit (Class A) security
+            '<p><ix:nonNumeric name="dei:TradingSymbol" contextRef="c-class-a-sec">CLASS</ix:nonNumeric></p>'
+            '<p><ix:nonNumeric name="dei:SecurityExchangeName" contextRef="c-class-a-sec">NYSE</ix:nonNumeric></p>'
+            # Typed security
+            '<p><ix:nonNumeric name="dei:TradingSymbol" contextRef="c-typed-z">TYPED</ix:nonNumeric></p>'
+            '<p><ix:nonNumeric name="dei:SecurityExchangeName" contextRef="c-typed-z">NYSE</ix:nonNumeric></p>'
+            # Unmatched explicit share count (ClassB → no registered ClassB security)
+            '<p><ix:nonFraction name="dei:EntityCommonStockSharesOutstanding" contextRef="c-class-b-shares" unitRef="shares" decimals="0">5555555</ix:nonFraction></p>'
+        )
+        doc = InlineXbrlDocument(
+            make_ixbrl_bytes(
+                contexts=dimless_ctx + explicit_sec_ctx + typed_sec_ctx + unmatched_shares_ctx,
+                units=_SHARES_UNIT,
+                facts=facts,
+            )
+        )
+        (
+            shares,
+            shares_date,
+            securities,
+            ambiguous_shares,
+            n_unmatched_explicit,
+            n_unmatched_typed,
+        ) = extractor._shares_and_securities(doc, "0000000000-00-000000")
+        # Order: dimensionless → explicit → typed → stubs
+        assert len(securities) == 4
+        assert securities[0].ticker == "DIMLESS"
+        assert securities[1].ticker == "CLASS"
+        assert securities[2].ticker == "TYPED"
+        assert securities[3].ticker == ""
+        assert securities[3].dimensioned_members != ""

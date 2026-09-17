@@ -10,6 +10,7 @@ import pytest
 from idi_ftm2j_shared.types import ScrapedDocument, ScrapedFiling
 from pytest_mock import MockerFixture
 
+from idi_company_facts.failures import FailureType
 from idi_company_facts.pipeline import CompanyFactsPipeline
 from idi_company_facts.types import (
     CompanyFactsRecord,
@@ -881,3 +882,98 @@ class TestSaveOutput:
         )
 
         assert pipeline.stats.multiple_registered_securities == 1
+
+    def test_unmatched_explicit_increments_stat(
+        self, pipeline: CompanyFactsPipeline, mocker: MockerFixture
+    ) -> None:
+        """_process_one increments unmatched_explicit when extract returns n_unmatched_explicit > 0."""
+        record = _make_record_with_securities([RegisteredSecurity(ticker="X")])
+        mocker.patch.object(pipeline.extractor, "extract", return_value=(record, [], 1, 0))
+        mocker.patch("idi_company_facts.pipeline.load_content", return_value=b"dummy")
+        mocker.patch(
+            "idi_company_facts.pipeline.InlineXbrlDocument", return_value=mocker.MagicMock()
+        )
+
+        pipeline._process_one(
+            Filing(
+                cik="0001234567",
+                accession_number="0001234567-24-000001",
+                form_type="10-K",
+                filing_date=date(2024, 1, 15),
+                primary_s3_key="s3://bucket/test.htm",
+                primary_url="https://sec.gov/test.htm",
+            )
+        )
+
+        assert pipeline.stats.unmatched_explicit == 1
+
+    def test_unmatched_typed_member_increments_stat(
+        self, pipeline: CompanyFactsPipeline, mocker: MockerFixture
+    ) -> None:
+        """_process_one increments unmatched_typed_member when extract returns n_unmatched_typed > 0."""
+        record = _make_record_with_securities([RegisteredSecurity(ticker="X")])
+        mocker.patch.object(pipeline.extractor, "extract", return_value=(record, [], 0, 1))
+        mocker.patch("idi_company_facts.pipeline.load_content", return_value=b"dummy")
+        mocker.patch(
+            "idi_company_facts.pipeline.InlineXbrlDocument", return_value=mocker.MagicMock()
+        )
+
+        pipeline._process_one(
+            Filing(
+                cik="0001234567",
+                accession_number="0001234567-24-000001",
+                form_type="10-K",
+                filing_date=date(2024, 1, 15),
+                primary_s3_key="s3://bucket/test.htm",
+                primary_url="https://sec.gov/test.htm",
+            )
+        )
+
+        assert pipeline.stats.unmatched_typed_member == 1
+
+    def test_ambiguous_shares_outstanding_increments_stat_and_records_failure(
+        self, pipeline: CompanyFactsPipeline, mocker: MockerFixture
+    ) -> None:
+        """_process_one increments ambiguous_shares_outstanding and records the failure."""
+        record = _make_record_with_securities([RegisteredSecurity(ticker="X")])
+        mocker.patch.object(
+            pipeline.extractor,
+            "extract",
+            return_value=(record, [FailureType.AMBIGUOUS_SHARES_OUTSTANDING], 0, 0),
+        )
+        mocker.patch("idi_company_facts.pipeline.load_content", return_value=b"dummy")
+        mocker.patch(
+            "idi_company_facts.pipeline.InlineXbrlDocument", return_value=mocker.MagicMock()
+        )
+        filing = Filing(
+            cik="0001234567",
+            accession_number="0001234567-24-000001",
+            form_type="10-K",
+            filing_date=date(2024, 1, 15),
+            primary_s3_key="s3://bucket/test.htm",
+            primary_url="https://sec.gov/test.htm",
+        )
+
+        pipeline._process_one(filing)
+
+        assert pipeline.stats.ambiguous_shares_outstanding == 1
+        assert (filing.cik, filing.accession_number) in pipeline.failures._entries
+
+    def test_all_shares_outstanding_as_of_iso_date(
+        self, pipeline: CompanyFactsPipeline, tmp_path: pytest.TempPathFactory
+    ) -> None:
+        """all_shares_outstanding_as_of uses ISO date strings; empty slot for None."""
+        pipeline.config.output_file = str(tmp_path / "out.parquet")
+        secs = [
+            RegisteredSecurity(ticker="ORD", shares_outstanding_as_of=None),
+            RegisteredSecurity(
+                ticker="ADSX",
+                shares_outstanding_as_of=date(2024, 9, 28),
+            ),
+        ]
+        record = _make_record_with_securities(secs)
+
+        pipeline.save_output([record])
+
+        df = pd.read_parquet(pipeline.config.output_file)
+        assert df["all_shares_outstanding_as_of"].iloc[0] == " | 2024-09-28"
