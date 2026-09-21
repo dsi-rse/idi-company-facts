@@ -2,15 +2,17 @@
 
 import dataclasses
 import datetime
-import re
 from decimal import Decimal
+
+from idi_ftm2j_shared.logs import get_logger
 
 from idi_company_facts.failures import FailureType
 from idi_company_facts.types import (
     CompanyFactsRecord,
+    Dimension,
+    Fact,
     Filing,
     RegisteredSecurity,
-    SecurityType,
 )
 from idi_company_facts.xbrl.concepts import (
     PERIOD_END,
@@ -25,6 +27,8 @@ from idi_company_facts.xbrl.concepts import (
 )
 from idi_company_facts.xbrl.parser import InlineXbrlDocument, parse_date_text
 
+_logger = get_logger(__name__)
+
 _ANNUAL_MIN_DAYS = 340
 _ANNUAL_MAX_DAYS = 380
 
@@ -33,47 +37,6 @@ _SECURITY_CONCEPTS = (TRADING_SYMBOL, SECURITY_EXCHANGE_NAME, SECURITY_12B_TITLE
 
 # Placeholder TradingSymbol values that indicate no listed security.
 _PLACEHOLDER_TICKERS = frozenset({"none", "-", "n/a", "not applicable"})
-
-# Substrings identifying a US exchange in dei:SecurityExchangeName.
-_US_EXCHANGE_MARKERS = ("nasdaq", "nyse", "new york stock exchange", "cboe", "bats")
-
-# Sort position for each SecurityType in _rank_securities — lower is earlier.
-_TYPE_ORDER: dict[SecurityType, int] = {
-    SecurityType.COMMON: 0,
-    SecurityType.ADS: 1,
-    SecurityType.PREFERRED: 2,
-    SecurityType.WARRANT: 3,
-    SecurityType.DEBT: 4,
-    SecurityType.OTHER: 5,
-}
-
-# Splits a camelCase/PascalCase local name into lowercase words so that word-
-# boundary patterns in _MEMBER_PATTERNS cannot fire on accidental substrings.
-# Example: "CrossroadsSystemsMember" → "crossroads systems member" (so \bads\b
-# does not match the "ads" hidden inside "crossroads").
-_CAMEL = re.compile(r"[A-Z]+(?![a-z])|[A-Z][a-z]*|[a-z]+|\d+")
-
-# Patterns applied to the space-joined, lowercase word blob of local dimension-
-# member names.  Evaluated in order; first match wins.
-# COMMON last to catch special cases before the common stock that may be wrappers or in combination
-# with common stocks/shares
-_MEMBER_PATTERNS: tuple[tuple[SecurityType, re.Pattern[str]], ...] = (
-    (SecurityType.ADS, re.compile(r"american\s+depositary|\bdepositary\s+receipt|\bads\b|\badr\b")),
-    (SecurityType.PREFERRED, re.compile(r"\bpreferred\b|\bpreference\b")),
-    (SecurityType.WARRANT, re.compile(r"\bwarrant\b")),
-    (SecurityType.DEBT, re.compile(r"\bnotes?\b|\bdebenture\b|\bbond\b")),
-    (SecurityType.COMMON, re.compile(r"\bcommon\b|\bordinary\b")),
-)
-
-# Patterns applied to the lowercased, whitespace-normalised Security12bTitle.
-# Word-boundary anchors guard against false hits.
-_TITLE_PATTERNS: tuple[tuple[SecurityType, re.Pattern[str]], ...] = (
-    (SecurityType.ADS, re.compile(r"american\s+depositary|\bads\b|\badr\b")),
-    (SecurityType.PREFERRED, re.compile(r"preferred|preference")),
-    (SecurityType.WARRANT, re.compile(r"\bwarrant|\bright\b|\brights\b|\bunit\b|\bunits\b")),
-    (SecurityType.DEBT, re.compile(r"\bnotes?\b|\bdebentures?\b|\bbonds?\b")),
-    (SecurityType.COMMON, re.compile(r"\bcommon\b|\bordinary\b")),
-)
 
 
 def _fmt(value: Decimal) -> str:
@@ -87,75 +50,17 @@ def _normalize_ticker(raw: str) -> str:
     return "" if ticker.lower() in _PLACEHOLDER_TICKERS else ticker
 
 
-def _is_us_exchange(exchange: str) -> bool:
-    """Heuristic: True when SecurityExchangeName looks like a US exchange."""
-    lowered = exchange.lower()
-    return any(marker in lowered for marker in _US_EXCHANGE_MARKERS)
+def _format_dimensions(dimensions: frozenset[Dimension]) -> str:
+    """Format Dimension pairs as a sorted ``axis=member`` string.
 
+    Multiple pairs are joined by ``"; "``.  Empty frozenset returns ``""``.
 
-def _classify_security(members: frozenset[str], title: str) -> SecurityType:
-    """Classify a security as COMMON, ADS, PREFERRED, DEBT, WARRANT, or OTHER.
-
-    Tries XBRL dimension-member names first (structured, filer-declared), then
-    falls back to dei:Security12bTitle text. A member-derived result always
-    outranks a title-derived result — member names are unambiguous declarations;
-    ADS titles, for example, mention the ordinary shares they represent.
-
-    Args:
-        members: Explicit dimension members from the security's XBRL context.
-            May be empty for dimensionless (entity-level) facts.
-        title: Value of dei:Security12bTitle. May be empty.
-
-    Returns:
-        The best-matching SecurityType, or OTHER when nothing matches.
+    The ``=`` separator is safe for both explicit and typed members because the
+    axis is always a QName (NCNames cannot contain ``=``).  To parse back, split
+    each ``"; "``-delimited token on the **first** ``=`` only (``str.split("=", 1)``)
+    — typed member values may themselves contain ``=``.
     """
-    if members:
-        blob = " ".join(
-            t.lower() for m in sorted(members) for t in _CAMEL.findall(m.split(":")[-1])
-        )
-        for sec_type, pattern in _MEMBER_PATTERNS:
-            if pattern.search(blob):
-                return sec_type
-
-    if title:
-        title_norm = " ".join(title.lower().split())
-        for sec_type, pattern in _TITLE_PATTERNS:
-            if pattern.search(title_norm):
-                return sec_type
-
-    return SecurityType.OTHER
-
-
-def _reconcile_types(
-    type_a: SecurityType,
-    has_members_a: bool,
-    type_b: SecurityType,
-    has_members_b: bool,
-) -> SecurityType:
-    """Pick the better type when two deduplicated entries disagree.
-
-    Non-OTHER beats OTHER; among two non-OTHER types, the member-derived
-    classification (structured) beats the title-derived one.
-
-    Args:
-        type_a: Classification of the first (existing) entry.
-        has_members_a: True when the first entry came from a dimensional context.
-        type_b: Classification of the second (incoming) entry.
-        has_members_b: True when the second entry came from a dimensional context.
-
-    Returns:
-        The resolved SecurityType.
-    """
-    if type_a == SecurityType.OTHER:
-        return type_b
-    if type_b == SecurityType.OTHER:
-        return type_a
-    # Both non-OTHER: member-derived wins over title-derived.
-    if has_members_a and not has_members_b:
-        return type_a
-    if has_members_b and not has_members_a:
-        return type_b
-    return type_a  # tie: keep the existing entry's type
+    return "; ".join(f"{d.axis}={d.member}" for d in sorted(dimensions, key=lambda d: d.axis))
 
 
 class CompanyFactsExtractor:
@@ -166,24 +71,34 @@ class CompanyFactsExtractor:
 
     def extract(
         self, filing: Filing, doc: InlineXbrlDocument
-    ) -> tuple[list[CompanyFactsRecord], list[FailureType]]:
+    ) -> tuple[CompanyFactsRecord, list[FailureType], int, int]:
         """Map one (filing, document) pair to exactly one CompanyFactsRecord.
 
         All securities registered under Section 12(b) on the cover page are
-        collected into ``registered_securities`` and ranked so the common-stock
-        class (the one whose share count is reported by
-        ``EntityCommonStockSharesOutstanding``) sorts first. Multiple securities
-        (ADS + ordinary shares, dual-class, listed notes) are expected and are
-        not treated as failures.
+        collected into ``registered_securities`` in extraction order.
+        Unmatched share count rows (i.e. only share count reported, no security with matching
+        dimension) appended at the end of the securities extracted from the Section 12(b) table.
 
         Args:
             filing: Metadata from the SEC scraper (CIK, dates, URLs).
             doc: Parsed iXBRL document for the filing's primary annual exhibit.
 
         Returns:
-            A tuple of (records, failures) where records is a single-element list
-            containing the extracted :class:`CompanyFactsRecord` and failures is a
-            list of :class:`FailureType` values for non-fatal extraction issues.
+            A tuple of (record, failures, n_unmatched_explicit, n_unmatched_typed).
+
+            ``n_unmatched_explicit``: count of explicit-member share groups with no matching
+            registered security.  An explicit-member context tags its dimension using a
+            standard QName member (``xbrli:explicitMember``), so each (axis, member) pair
+            is a known concept.  Groups are keyed by the full frozenset of (axis, member)
+            pairs; a group with no matching security becomes a stub row.
+
+            ``n_unmatched_typed``: count of typed-member share groups with no matching
+            registered security.  A typed-member context (``xbrli:typedMember``) has the
+            same (axis, member) structure but the member is a free-form string rather than
+            a taxonomy QName.  Matched against typed-member securities by exact pair-set
+            equality; unmatched groups become stubs.
+
+            Both counters are incremented once per unmatched group, not once per fact.
         """
         period_end = self._period_end(doc)
         market_value, mv_date, mv_currency = self._market_value(doc)
@@ -191,17 +106,25 @@ class CompanyFactsExtractor:
         revenue, rev_date, rev_currency, rev_ambiguous = self._revenue(doc, period_end)
         registrant = self._registrant_name(doc) or filing.company_name
 
-        shares, shares_date, securities = self._shares_and_securities(doc)
+        (
+            shares,
+            shares_date,
+            securities,
+            ambiguous_shares,
+            n_unmatched_explicit,
+            n_unmatched_typed,
+        ) = self._shares_and_securities(doc, filing.accession_number)
 
         failures: list[FailureType] = []
         if period_end is None:
-            # Missing anchor — don't also report NO_REVENUE_CONCEPT since the
-            # revenue walk was never run against a valid period end.
+            # No period_end to anchor the revenue concept
             failures.append(FailureType.MISSING_PERIOD_END)
         elif revenue is None:
             failures.append(FailureType.NO_REVENUE_CONCEPT)
         elif rev_ambiguous:
             failures.append(FailureType.AMBIGUOUS_REVENUE)
+        if ambiguous_shares:
+            failures.append(FailureType.AMBIGUOUS_SHARES_OUTSTANDING)
 
         now = datetime.datetime.now(datetime.UTC)
         record = CompanyFactsRecord(
@@ -225,7 +148,7 @@ class CompanyFactsExtractor:
             revenue_currency=rev_currency or "",
             last_accessed=now,
         )
-        return [record], failures
+        return record, failures, n_unmatched_explicit, n_unmatched_typed
 
     def _period_end(self, doc: InlineXbrlDocument) -> datetime.date | None:
         """Return DocumentPeriodEndDate as a date, or None if absent or unparseable.
@@ -255,28 +178,35 @@ class CompanyFactsExtractor:
     def _market_value(
         self, doc: InlineXbrlDocument
     ) -> tuple[Decimal | None, datetime.date | None, str | None]:
-        """Return (public float, instant date, currency), all None if absent."""
+        """Return (public float, as-of date, currency), all None if absent."""
         fact = doc.single_fact(PUBLIC_FLOAT)
         if fact is None or not isinstance(fact.value, Decimal):
             return None, None, None
-        return fact.value, fact.context.instant, fact.unit
+        return fact.value, fact.context.as_of_date, fact.unit
 
     def _shares_and_securities(
-        self, doc: InlineXbrlDocument
-    ) -> tuple[Decimal | None, datetime.date | None, list[RegisteredSecurity]]:
-        """Return (total_shares, as_of_date, ranked registered securities).
+        self, doc: InlineXbrlDocument, accession_number: str = ""
+    ) -> tuple[Decimal | None, datetime.date | None, list[RegisteredSecurity], bool, int, int]:
+        """Takes security facts from the document and matches them per dimension.
 
-        Shares: prefers a dimensionless EntityCommonStockSharesOutstanding fact
-        (the entity-level total). When only per-class (dimensioned) facts exist
-        — e.g. dual-class share structures — sums all classes at the latest
-        reported instant.
+        Return (scalar, as_of_date, securities, ambiguous_shares, n_unmatched_explicit, n_unmatched_typed).
 
-        Securities: collects *all* Section 12(b) securities from the cover page
-        (see :meth:`_registered_securities`), then ranks them via
-        :meth:`_rank_securities` using the shares context as an anchor. The
-        anchor identifies which security is the common-stock class so it sorts
-        first in the returned list; all other registered securities (ADS, second
-        share class, listed notes) are retained in order behind it.
+        scalar: dimensionless EntityCommonStockSharesOutstanding at the latest as-of date,
+        or None.  Its relationship to per-security counts is unresolvable here.
+
+        ambiguous_shares: True when two dimensionless facts share the same latest instant
+        but disagree on value.
+
+        securities: all Section 12(b) securities in extraction order, with dimensioned
+        share counts attributed by :meth:`_attribute_shares`.  Unmatched groups are
+        appended as stub rows with empty name/ticker/exchange.
+
+        n_unmatched_explicit: count of explicit-member share groups with no matching
+        registered security, incremented once per group.
+
+        n_unmatched_typed: count of typed-member share groups (distinct (axis, member string)
+        pair sets) with no matching registered security, incremented once per group.  A typed
+        security tagged with the same (axis, member string) pair set will match.
         """
         shares_facts = [
             f
@@ -284,86 +214,204 @@ class CompanyFactsExtractor:
             if not f.context.has_dimensions and isinstance(f.value, Decimal)
         ]
 
-        shares_value: Decimal | None
-        dim_shares_members: frozenset[str] = frozenset()
-        anchor_ctx_id: str | None = None
-
+        ambiguous_shares = False
         if shares_facts:
-            fact = max(shares_facts, key=lambda f: f.context.instant or datetime.date.min)
-            shares_value = fact.value
-            shares_date = fact.context.instant
-            anchor_ctx_id = fact.context.context_id
-        else:
-            # Fall back to summing per-class dimensioned facts at the latest instant.
-            dim_facts = [
+            latest_as_of = max(f.context.as_of_date or datetime.date.min for f in shares_facts)
+            latest_facts = [
                 f
-                for f in doc.facts(SHARES_OUTSTANDING)
-                if f.context.has_dimensions
-                and isinstance(f.value, Decimal)
-                and f.context.instant is not None
+                for f in shares_facts
+                if (f.context.as_of_date or datetime.date.min) == latest_as_of
             ]
-            if dim_facts:
-                latest = max(f.context.instant for f in dim_facts)  # type: ignore[arg-type]
-                at_latest = [f for f in dim_facts if f.context.instant == latest]
-                shares_value = sum(f.value for f in at_latest)  # type: ignore[assignment]
-                shares_date = latest
-                # Dimension members across the share-class contexts, used to
-                # identify which security group anchors the shares fact.
-                dim_shares_members = frozenset(
-                    m for f in at_latest for m in f.context.dimension_members
+            if len({f.value for f in latest_facts}) > 1:
+                ambiguous_shares = True
+                _logger.info(
+                    "%s: ambiguous dimensionless shares at %s — %s; using first value",
+                    accession_number,
+                    latest_as_of,
+                    ", ".join(_fmt(f.value) for f in latest_facts),
                 )
-            else:
-                shares_value = None
-                shares_date = None
+            fact = latest_facts[0]
+            shares_value: Decimal | None = fact.value
+            shares_date: datetime.date | None = fact.context.as_of_date
+        else:
+            shares_value = None
+            shares_date = None
 
-        securities = self._registered_securities(doc)
-        ranked = self._rank_securities(
-            securities,
-            anchor_ctx_id=anchor_ctx_id,
-            anchor_members=dim_shares_members,
+        explicit_entries, typed_entries = self._registered_securities(doc)
+        securities, n_unmatched_explicit, n_unmatched_typed = self._attribute_shares(
+            doc, explicit_entries, typed_entries, accession_number, shares_value
         )
-        return shares_value, shares_date, ranked
+        return (
+            shares_value,
+            shares_date,
+            securities,
+            ambiguous_shares,
+            n_unmatched_explicit,
+            n_unmatched_typed,
+        )
+
+    def _attribute_shares(
+        self,
+        doc: InlineXbrlDocument,
+        explicit_entries: list[tuple[frozenset[Dimension], RegisteredSecurity]],
+        typed_entries: list[tuple[frozenset[Dimension], RegisteredSecurity]],
+        accession_number: str = "",
+        scalar: Decimal | None = None,
+    ) -> tuple[list[RegisteredSecurity], int, int]:
+        """Attribute dimensioned share counts to securities; append unmatched rows as stubs.
+
+        Both explicit-member and typed-member contexts are treated symmetrically as
+        (axis, member) pairs grouped by their full frozenset, then matched against their
+        respective security pool by exact pair-set equality:
+
+        - Explicit (``xbrli:explicitMember``): member is a QName referencing a
+          named concept in a taxonomy (``prefix:localName`` format).
+          Matched against ``explicit_entries``.
+        - Typed (``xbrli:typedMember``): member is a free-form string constrained only
+          by an XML Schema type, not a fixed taxonomy.  Matched against
+          ``typed_entries``.
+
+        Keeping the pools separate prevents cross-matching between an explicit-member
+        share count and a typed-member security (or vice versa) whose (axis, value)
+        strings happen to coincide.  Unmatched groups in either pool become stub rows
+        appended after all security rows, with empty name/ticker/exchange and
+        ``dimensioned_members`` set to the ``"axis=member"``-formatted pairs.
+
+        Returns:
+            (securities, n_unmatched_explicit, n_unmatched_typed) where each counter is
+            incremented once per unmatched group, not once per fact.
+        """
+        dim_facts = [
+            f
+            for f in doc.facts(SHARES_OUTSTANDING)
+            if f.context.has_dimensions
+            and isinstance(f.value, Decimal)
+            and f.context.as_of_date is not None
+        ]
+
+        all_entries = explicit_entries + typed_entries
+        if not dim_facts:
+            return [sec for _, sec in all_entries], 0, 0
+
+        # Partition share count facts by member type.
+        # Explicit-member facts keyed by their explicit Dimension pair-set.
+        # Typed-member facts keyed by their typed Dimension pair-set.
+        explicit_groups: dict[frozenset[Dimension], list] = {}
+        typed_groups: dict[frozenset[Dimension], list] = {}
+
+        for f in dim_facts:
+            explicit_dims = frozenset(d for d in f.context.dimensions if not d.is_typed)
+            typed_dims = frozenset(d for d in f.context.dimensions if d.is_typed)
+            if explicit_dims:
+                explicit_groups.setdefault(explicit_dims, []).append(f)
+            elif typed_dims:
+                typed_groups.setdefault(typed_dims, []).append(f)
+
+        def _best(facts: list[Fact]) -> Fact:
+            return max(facts, key=lambda f: f.context.as_of_date or datetime.date.min)
+
+        explicit_sec_list = list(explicit_entries)
+        typed_sec_list = list(typed_entries)
+        appended: list[RegisteredSecurity] = []
+
+        def _write_or_stub(
+            sec_list: list[tuple[frozenset[Dimension], RegisteredSecurity]],
+            matched_idx: int | None,
+            bf: Fact,
+            dm: str,
+        ) -> bool:
+            """Write share count into matched security row, or append a stub. Returns True if stub."""
+            if matched_idx is not None:
+                old_members, old_sec = sec_list[matched_idx]
+                sec_list[matched_idx] = (
+                    old_members,
+                    dataclasses.replace(
+                        old_sec,
+                        shares_outstanding=_fmt(bf.value),
+                        shares_outstanding_as_of=bf.context.as_of_date,
+                    ),
+                )
+                return False
+            appended.append(
+                RegisteredSecurity(
+                    dimensioned_members=dm,
+                    shares_outstanding=_fmt(bf.value),
+                    shares_outstanding_as_of=bf.context.as_of_date,
+                )
+            )
+            return True
+
+        def _match_and_attribute(
+            groups: dict[frozenset[Dimension], list],
+            sec_list: list[tuple[frozenset[Dimension], RegisteredSecurity]],
+            label: str,
+        ) -> int:
+            n_unmatched = 0
+            for pair_set, facts in groups.items():
+                bf = _best(facts)
+                matched_idx = next(
+                    (i for i, (pairs, _) in enumerate(sec_list) if pairs == pair_set), None
+                )
+                dm = _format_dimensions(pair_set)
+                if _write_or_stub(sec_list, matched_idx, bf, dm):
+                    n_unmatched += 1
+                    _logger.info(
+                        "%s: unmatched %s share group (%s)=%s",
+                        accession_number,
+                        label,
+                        dm,
+                        _fmt(bf.value),
+                    )
+            return n_unmatched
+
+        n_unmatched_explicit = _match_and_attribute(
+            explicit_groups, explicit_sec_list, "explicit-member"
+        )
+        n_unmatched_typed = _match_and_attribute(typed_groups, typed_sec_list, "typed-member")
+
+        return (
+            [sec for _, sec in explicit_sec_list] + [sec for _, sec in typed_sec_list] + appended,
+            n_unmatched_explicit,
+            n_unmatched_typed,
+        )
 
     def _registered_securities(
         self, doc: InlineXbrlDocument
-    ) -> list[tuple[frozenset[str], frozenset[str], RegisteredSecurity]]:
+    ) -> tuple[
+        list[tuple[frozenset[Dimension], RegisteredSecurity]],
+        list[tuple[frozenset[Dimension], RegisteredSecurity]],
+    ]:
         """Collect every registered security tagged on the cover page.
 
-        Grouping rules:
-          * Dimensional facts are grouped by their explicit-member set — each
-            distinct member set (e.g. ``AmericanDepositarySharesMember`` vs
-            ``OrdinarySharesMember``, or Class A vs Class B) is one security.
-          * Dimensionless facts are grouped per context. When the dimensionless
-            facts are mutually consistent (at most one distinct value per
-            concept) they are merged into a single security — the common
-            single-class pattern where DEI facts span several contexts.
+        Returns ``(explicit_entries, typed_entries)`` where each is a list of
+        ``(dimensions, security)`` tuples in extraction order.
 
-        Duplicate triples (the same security tagged both dimensionally and
-        dimensionlessly) are collapsed, preferring the entry with more fields.
-
-        Returns:
-            List of (context_ids, dimension_members, security) tuples in
-            document order. The first two elements let the caller match a
-            security back to the shares-outstanding anchor context.
+        Explicit entries (dimensionless and explicit-member) come first;
+        typed entries (typed-member contexts) are returned separately so
+        :meth:`_attribute_shares` can match each pool against its own share
+        count groups.  Both use ``frozenset[Dimension]`` as the dimension key —
+        ``is_typed=False`` for explicit members, ``is_typed=True`` for typed.
         """
-        dim_groups: dict[frozenset[str], dict[str, str]] = {}
-        dim_ctx_ids: dict[frozenset[str], set[str]] = {}
+        explicit_dim_groups: dict[frozenset[Dimension], dict[str, str]] = {}
+        typed_dim_groups: dict[frozenset[Dimension], dict[str, str]] = {}
         dimless_groups: dict[str, dict[str, str]] = {}
         for concept in _SECURITY_CONCEPTS:
             for f in doc.facts(concept):
                 ctx = f.context
                 if ctx.has_dimensions:
-                    slot = dim_groups.setdefault(ctx.dimension_members, {})
-                    dim_ctx_ids.setdefault(ctx.dimension_members, set()).add(ctx.context_id)
+                    explicit_dims = frozenset(d for d in ctx.dimensions if not d.is_typed)
+                    typed_dims = frozenset(d for d in ctx.dimensions if d.is_typed)
+                    if explicit_dims:
+                        slot = explicit_dim_groups.setdefault(explicit_dims, {})
+                    else:
+                        slot = typed_dim_groups.setdefault(typed_dims, {})
                 else:
                     slot = dimless_groups.setdefault(ctx.context_id, {})
-                # Keep the first value per concept within a group (repeated
-                # cover-page tags of the same fact are common).
+                # Keep the first value per concept within a group.
                 slot.setdefault(concept, str(f.value))
 
-        # Merge dimensionless contexts when they don't conflict — the typical
-        # single-class filer tags ticker in one duration context and title in
-        # another, all describing the same security.
+        # Merge dimensionless contexts when they don't conflict.
+        # typically, each fact within a 12b security row are tagged with the same context ID.
         if dimless_groups:
             conflicting = any(
                 len({" ".join(slot[c].split()) for slot in dimless_groups.values() if c in slot})
@@ -377,26 +425,37 @@ class CompanyFactsExtractor:
                         merged.setdefault(concept, value)
                 dimless_groups = {"|".join(sorted(dimless_groups)): merged}
 
-        entries: list[tuple[frozenset[str], frozenset[str], RegisteredSecurity]] = []
-        for members, slot in dim_groups.items():
-            sec = self._build_security(slot, members)
-            if sec is not None:
-                entries.append((frozenset(dim_ctx_ids[members]), members, sec))
-        for ctx_key, slot in dimless_groups.items():
+        explicit_entries: list[tuple[frozenset[Dimension], RegisteredSecurity]] = []
+
+        # Dimensionless first, then explicit-dimension in first-seen document order.
+        for slot in dimless_groups.values():
             sec = self._build_security(slot, frozenset())
             if sec is not None:
-                entries.append((frozenset(ctx_key.split("|")), frozenset(), sec))
+                explicit_entries.append((frozenset(), sec))
+        for dims, slot in explicit_dim_groups.items():
+            sec = self._build_security(slot, dims)
+            if sec is not None:
+                explicit_entries.append((dims, sec))
 
-        return self._dedupe_securities(entries)
+        typed_entries: list[tuple[frozenset[Dimension], RegisteredSecurity]] = []
+        for typed_dims, slot in typed_dim_groups.items():
+            sec = self._build_security(slot, typed_dims)
+            if sec is not None:
+                typed_entries.append((typed_dims, sec))
+
+        return self._dedupe_securities(explicit_entries), typed_entries
 
     @staticmethod
-    def _build_security(slot: dict[str, str], members: frozenset[str]) -> RegisteredSecurity | None:
+    def _build_security(
+        slot: dict[str, str],
+        dimensions: frozenset[Dimension],
+    ) -> RegisteredSecurity | None:
         """Build a RegisteredSecurity from a concept→value slot, or None if empty.
 
         Args:
             slot: Mapping of DEI concept name to string value for this security.
-            members: Dimension members from the security's XBRL context; empty
-                for dimensionless (entity-level) facts.
+            dimensions: (axis, member) pairs from the security's XBRL context;
+                empty for dimensionless (entity-level) facts.
 
         Returns:
             A populated RegisteredSecurity, or None when all fields are empty.
@@ -406,114 +465,55 @@ class CompanyFactsExtractor:
         name = " ".join(slot.get(SECURITY_12B_TITLE, "").split())
         if not (ticker or exchange or name):
             return None
+        dim_members = _format_dimensions(dimensions)
         return RegisteredSecurity(
             security_name=name,
             ticker=ticker,
             exchange=exchange,
-            security_type=_classify_security(members, name),
+            dimensioned_members=dim_members,
         )
 
     @staticmethod
     def _dedupe_securities(
-        entries: list[tuple[frozenset[str], frozenset[str], RegisteredSecurity]],
-    ) -> list[tuple[frozenset[str], frozenset[str], RegisteredSecurity]]:
+        entries: list[tuple[frozenset[Dimension], RegisteredSecurity]],
+    ) -> list[tuple[frozenset[Dimension], RegisteredSecurity]]:
         """Collapse entries describing the same security.
 
-        Entries are keyed by (ticker, members) for ticker-bearing securities,
-        or (name, exchange) for ticker-less ones. Two entries with the same
-        ticker but different dimension members (e.g. ordinary shares and ADS
-        both trading as "BABA") are never conflated. Dimensionless entries
-        (members = frozenset()) only merge with other dimensionless entries for
-        the same ticker.
+        Keyed by (ticker, dimensions) for ticker-bearing securities, or
+        (name, exchange, dimensions) for ticker-less ones.  Including the full
+        dimension pair-set in the ticker-less key ensures two distinct classes
+        that share the same name+exchange (e.g. different class-axis members,
+        no ticker) are kept as separate rows rather than collapsed.
 
-        When duplicates collide, each field takes the first non-empty value.
-        The security_type is reconciled: member-derived beats title-derived,
-        non-OTHER beats OTHER.
+        When duplicates do collide each field takes the first non-empty value.
+
+        This function is applied to explicit entries only; typed entries are
+        already keyed by unique dimension sets in _registered_securities and
+        do not need deduplication.
         """
-        by_key: dict[tuple, tuple[frozenset[str], frozenset[str], RegisteredSecurity]] = {}
-        for ctx_ids, members, sec in entries:
+        by_key: dict[tuple, tuple[frozenset[Dimension], RegisteredSecurity]] = {}
+        for dimensions, sec in entries:
             if sec.ticker:
-                key: tuple = ("ticker", sec.ticker.lower(), members)
+                key: tuple = ("ticker", sec.ticker.lower(), dimensions)
             else:
-                key = (sec.security_name.lower(), sec.exchange.lower())
+                key = (sec.security_name.lower(), sec.exchange.lower(), dimensions)
             existing = by_key.get(key)
             if existing is None:
-                by_key[key] = (ctx_ids, members, sec)
+                by_key[key] = (dimensions, sec)
                 continue
-            ex_ctx, ex_members, ex_sec = existing
-            resolved_type = _reconcile_types(
-                ex_sec.security_type,
-                bool(ex_members),
-                sec.security_type,
-                bool(members),
-            )
+            ex_dims, ex_sec = existing
             merged_sec = dataclasses.replace(
                 ex_sec,
                 security_name=ex_sec.security_name or sec.security_name,
                 ticker=ex_sec.ticker or sec.ticker,
                 exchange=ex_sec.exchange or sec.exchange,
-                security_type=resolved_type,
+                dimensioned_members=ex_sec.dimensioned_members or sec.dimensioned_members,
             )
-            by_key[key] = (ex_ctx | ctx_ids, ex_members | members, merged_sec)
+            by_key[key] = (ex_dims | dimensions, merged_sec)
         return list(by_key.values())
 
-    @staticmethod
-    def _rank_securities(
-        entries: list[tuple[frozenset[str], frozenset[str], RegisteredSecurity]],
-        *,
-        anchor_ctx_id: str | None,
-        anchor_members: frozenset[str],
-    ) -> list[RegisteredSecurity]:
-        """Order securities so the common-stock class sorts first.
-
-        Tier 1 — SecurityType: COMMON always leads, regardless of anchor context.
-        This overrides the previous anchor-only behaviour and prevents a sloppy
-        filer (one who tags EntityCommonStockSharesOutstanding in the ADS context)
-        from promoting the ADS into the flat ticker/exchange columns.
-
-        Tier 2 — anchor match: among COMMON securities, the one sharing a context
-        (or dimension member) with EntityCommonStockSharesOutstanding sorts first.
-        The dimensionless↔dimensionless pairing rule still applies: a dimensionless
-        anchor matches any dimensionless security group.
-
-        Tiers 3–6 — UI convenience order for the remaining (non-primary) securities:
-        ADS < PREFERRED < WARRANT < DEBT < OTHER by type; listed before unlisted;
-        US-resolvable exchanges before home-country; document order as stable fallback.
-
-        Edge case: if no COMMON security exists (e.g. filer registers only preferred
-        or notes), the best available by the remaining keys fills the flat columns.
-        """
-
-        def sort_key(
-            indexed: tuple[int, tuple[frozenset[str], frozenset[str], RegisteredSecurity]],
-        ) -> tuple:
-            idx, (ctx_ids, members, sec) = indexed
-            is_common = (
-                (anchor_ctx_id is not None and anchor_ctx_id in ctx_ids)
-                or bool(members & anchor_members)
-                # The typical single-entity pattern: shares outstanding in a
-                # dimensionless instant context, cover-page DEI facts in a
-                # dimensionless duration context. A dimensionless anchor pairs
-                # with the dimensionless (entity-level) security group.
-                or (anchor_ctx_id is not None and not members)
-            )
-            return (
-                sec.security_type != SecurityType.COMMON,  # COMMON first (tier 1)
-                not is_common,  # anchor-matched COMMON first (tier 2)
-                _TYPE_ORDER[sec.security_type],  # ADS < PREFERRED < WARRANT < DEBT < OTHER
-                not sec.ticker,  # listed before unlisted
-                not _is_us_exchange(sec.exchange),  # US listings before home-country
-                idx,  # stable: document order
-            )
-
-        return [sec for _, (_, _, sec) in sorted(enumerate(entries), key=sort_key)]
-
     def _shell_company(self, doc: InlineXbrlDocument) -> bool | None:
-        """Return EntityShellCompany as a bool, or None if absent or unrecognised.
-
-        Handles both ixt:booleanfalse/true typed values and plain-text fallbacks
-        (some filers write 'No'/'Yes' without a format attribute).
-        """
+        """Return EntityShellCompany as a bool, or None if absent or unrecognised."""
         fact = doc.single_fact(SHELL_COMPANY)
         if fact is None:
             return None
@@ -537,10 +537,6 @@ class CompanyFactsExtractor:
         Walks REVENUE_CONCEPTS in priority order, collecting the first qualifying
         fact per concept. A fact qualifies when it is dimensionless, ends on
         period_end, and covers an annual duration (340–380 days).
-
-        is_ambiguous is True when multiple concepts each yield a qualifying fact
-        and their values disagree. Equal values across concepts are not ambiguous.
-        The priority-order winner is always returned regardless of ambiguity.
         """
         if period_end is None:
             return None, None, None, False
@@ -561,7 +557,7 @@ class CompanyFactsExtractor:
                 if not isinstance(fact.value, Decimal):
                     continue
                 concept_hits.append((fact.value, fact.context.end, fact.unit))
-                break  # first qualifying fact per concept
+                break
 
         if not concept_hits:
             return None, None, None, False

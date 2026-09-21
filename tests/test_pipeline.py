@@ -10,13 +10,13 @@ import pytest
 from idi_ftm2j_shared.types import ScrapedDocument, ScrapedFiling
 from pytest_mock import MockerFixture
 
+from idi_company_facts.failures import FailureType
 from idi_company_facts.pipeline import CompanyFactsPipeline
 from idi_company_facts.types import (
     CompanyFactsRecord,
     Filing,
     PipelineConfig,
     RegisteredSecurity,
-    SecurityType,
 )
 from tests.conftest import make_ixbrl_bytes
 
@@ -710,7 +710,7 @@ class TestCiksOverride:
             "idi_company_facts.pipeline.iter_filings_by_form_type", return_value=iter([latest])
         )
         record = _make_record_with_securities([RegisteredSecurity(ticker="TST")])
-        mocker.patch.object(pipeline.extractor, "extract", return_value=([record], []))
+        mocker.patch.object(pipeline.extractor, "extract", return_value=(record, [], 0, 0))
         mocker.patch(
             "idi_company_facts.pipeline.InlineXbrlDocument", return_value=mocker.MagicMock()
         )
@@ -808,7 +808,7 @@ class TestRun:
             "idi_company_facts.pipeline.iter_filings_by_form_type",
             return_value=iter([good]),
         )
-        process_one = mocker.patch.object(pipeline, "_process_one", return_value=[])
+        process_one = mocker.patch.object(pipeline, "_process_one", return_value=None)
 
         pipeline.run()
 
@@ -1001,7 +1001,7 @@ class TestSaveOutput:
             security_name="Common Stock",
             ticker="AAPL",
             exchange="NASDAQ",
-            security_type=SecurityType.COMMON,
+            dimensioned_members="us-gaap:StatementClassOfStockAxis=us-gaap:CommonStockMember",
         )
         record = _make_record_with_securities([sec])
 
@@ -1011,24 +1011,30 @@ class TestSaveOutput:
         assert df["all_tickers"].iloc[0] == "AAPL"
         assert df["all_security_names"].iloc[0] == "Common Stock"
         assert df["all_exchanges"].iloc[0] == "NASDAQ"
-        assert df["all_security_types"].iloc[0] == "common"
+        assert (
+            df["all_dimensioned_members"].iloc[0]
+            == "us-gaap:StatementClassOfStockAxis=us-gaap:CommonStockMember"
+        )
+        assert df["all_shares_outstanding"].iloc[0] == ""
+        assert df["all_shares_outstanding_as_of"].iloc[0] == ""
 
     def test_multiple_securities_pipe_delimited(
         self, pipeline: CompanyFactsPipeline, tmp_path: pytest.TempPathFactory
     ) -> None:
-        """Multiple securities produce pipe-delimited values, common stock first."""
+        """Multiple securities produce pipe-delimited values in extraction order."""
         pipeline.config.output_file = str(tmp_path / "out.parquet")
         common = RegisteredSecurity(
             security_name="Ordinary Shares",
             ticker="ORD",
             exchange="Euronext Paris",
-            security_type=SecurityType.COMMON,
+            dimensioned_members="",
         )
         ads = RegisteredSecurity(
             security_name="American Depositary Shares",
             ticker="ADSX",
             exchange="NYSE",
-            security_type=SecurityType.ADS,
+            dimensioned_members="us-gaap:StatementClassOfStockAxis=us-gaap:AmericanDepositarySharesMember",
+            shares_outstanding="500000000",
         )
         record = _make_record_with_securities([common, ads])
 
@@ -1038,7 +1044,11 @@ class TestSaveOutput:
         assert df["all_tickers"].iloc[0] == "ORD | ADSX"
         assert df["all_security_names"].iloc[0] == "Ordinary Shares | American Depositary Shares"
         assert df["all_exchanges"].iloc[0] == "Euronext Paris | NYSE"
-        assert df["all_security_types"].iloc[0] == "common | ads"
+        assert (
+            df["all_dimensioned_members"].iloc[0]
+            == " | us-gaap:StatementClassOfStockAxis=us-gaap:AmericanDepositarySharesMember"
+        )
+        assert df["all_shares_outstanding"].iloc[0] == " | 500000000"
 
     def test_registered_securities_column_absent(
         self, pipeline: CompanyFactsPipeline, tmp_path: pytest.TempPathFactory
@@ -1046,11 +1056,7 @@ class TestSaveOutput:
         """The raw registered_securities list column is not written to the parquet output."""
         pipeline.config.output_file = str(tmp_path / "out.parquet")
         record = _make_record_with_securities(
-            [
-                RegisteredSecurity(
-                    ticker="AAPL", exchange="NASDAQ", security_type=SecurityType.COMMON
-                )
-            ]
+            [RegisteredSecurity(ticker="AAPL", exchange="NASDAQ")]
         )
 
         pipeline.save_output([record])
@@ -1058,22 +1064,31 @@ class TestSaveOutput:
         df = pd.read_parquet(pipeline.config.output_file)
         assert "registered_securities" not in df.columns
 
-    def test_three_security_types_pipe_delimited(
+    def test_three_securities_class_members_pipe_delimited(
         self, pipeline: CompanyFactsPipeline, tmp_path: pytest.TempPathFactory
     ) -> None:
-        """Three-security fixture produces 'common | ads | debt' in all_security_types."""
+        """Three-security fixture produces pipe-delimited all_dimensioned_members."""
         pipeline.config.output_file = str(tmp_path / "out.parquet")
         secs = [
-            RegisteredSecurity(ticker="ORD", security_type=SecurityType.COMMON),
-            RegisteredSecurity(ticker="ADSX", security_type=SecurityType.ADS),
-            RegisteredSecurity(ticker="ORD27", security_type=SecurityType.DEBT),
+            RegisteredSecurity(ticker="ORD", dimensioned_members=""),
+            RegisteredSecurity(
+                ticker="ADSX",
+                dimensioned_members="us-gaap:StatementClassOfStockAxis=us-gaap:AmericanDepositarySharesMember",
+            ),
+            RegisteredSecurity(
+                ticker="ORD27",
+                dimensioned_members="us-gaap:StatementClassOfStockAxis=us-gaap:SeniorNotesMember",
+            ),
         ]
         record = _make_record_with_securities(secs)
 
         pipeline.save_output([record])
 
         df = pd.read_parquet(pipeline.config.output_file)
-        assert df["all_security_types"].iloc[0] == "common | ads | debt"
+        assert df["all_dimensioned_members"].iloc[0] == (
+            " | us-gaap:StatementClassOfStockAxis=us-gaap:AmericanDepositarySharesMember"
+            " | us-gaap:StatementClassOfStockAxis=us-gaap:SeniorNotesMember"
+        )
 
     def test_merges_with_existing_output(
         self, pipeline: CompanyFactsPipeline, tmp_path: pytest.TempPathFactory
@@ -1112,13 +1127,11 @@ class TestSaveOutput:
     ) -> None:
         """_process_one increments multiple_registered_securities when > 1 security."""
         two_secs = [
-            RegisteredSecurity(
-                ticker="ORD", exchange="Euronext Paris", security_type=SecurityType.COMMON
-            ),
-            RegisteredSecurity(ticker="ADSX", exchange="NYSE", security_type=SecurityType.ADS),
+            RegisteredSecurity(ticker="ORD", exchange="Euronext Paris"),
+            RegisteredSecurity(ticker="ADSX", exchange="NYSE"),
         ]
         record = _make_record_with_securities(two_secs)
-        mocker.patch.object(pipeline.extractor, "extract", return_value=([record], []))
+        mocker.patch.object(pipeline.extractor, "extract", return_value=(record, [], 0, 0))
         mocker.patch("idi_company_facts.pipeline.load_content", return_value=b"dummy")
         mocker.patch(
             "idi_company_facts.pipeline.InlineXbrlDocument", return_value=mocker.MagicMock()
@@ -1136,3 +1149,98 @@ class TestSaveOutput:
         )
 
         assert pipeline.stats.multiple_registered_securities == 1
+
+    def test_unmatched_explicit_increments_stat(
+        self, pipeline: CompanyFactsPipeline, mocker: MockerFixture
+    ) -> None:
+        """_process_one increments unmatched_explicit when extract returns n_unmatched_explicit > 0."""
+        record = _make_record_with_securities([RegisteredSecurity(ticker="X")])
+        mocker.patch.object(pipeline.extractor, "extract", return_value=(record, [], 1, 0))
+        mocker.patch("idi_company_facts.pipeline.load_content", return_value=b"dummy")
+        mocker.patch(
+            "idi_company_facts.pipeline.InlineXbrlDocument", return_value=mocker.MagicMock()
+        )
+
+        pipeline._process_one(
+            Filing(
+                cik="0001234567",
+                accession_number="0001234567-24-000001",
+                form_type="10-K",
+                filing_date=date(2024, 1, 15),
+                primary_s3_key="s3://bucket/test.htm",
+                primary_url="https://sec.gov/test.htm",
+            )
+        )
+
+        assert pipeline.stats.unmatched_explicit == 1
+
+    def test_unmatched_typed_member_increments_stat(
+        self, pipeline: CompanyFactsPipeline, mocker: MockerFixture
+    ) -> None:
+        """_process_one increments unmatched_typed_member when extract returns n_unmatched_typed > 0."""
+        record = _make_record_with_securities([RegisteredSecurity(ticker="X")])
+        mocker.patch.object(pipeline.extractor, "extract", return_value=(record, [], 0, 1))
+        mocker.patch("idi_company_facts.pipeline.load_content", return_value=b"dummy")
+        mocker.patch(
+            "idi_company_facts.pipeline.InlineXbrlDocument", return_value=mocker.MagicMock()
+        )
+
+        pipeline._process_one(
+            Filing(
+                cik="0001234567",
+                accession_number="0001234567-24-000001",
+                form_type="10-K",
+                filing_date=date(2024, 1, 15),
+                primary_s3_key="s3://bucket/test.htm",
+                primary_url="https://sec.gov/test.htm",
+            )
+        )
+
+        assert pipeline.stats.unmatched_typed_member == 1
+
+    def test_ambiguous_shares_outstanding_increments_stat_and_records_failure(
+        self, pipeline: CompanyFactsPipeline, mocker: MockerFixture
+    ) -> None:
+        """_process_one increments ambiguous_shares_outstanding and records the failure."""
+        record = _make_record_with_securities([RegisteredSecurity(ticker="X")])
+        mocker.patch.object(
+            pipeline.extractor,
+            "extract",
+            return_value=(record, [FailureType.AMBIGUOUS_SHARES_OUTSTANDING], 0, 0),
+        )
+        mocker.patch("idi_company_facts.pipeline.load_content", return_value=b"dummy")
+        mocker.patch(
+            "idi_company_facts.pipeline.InlineXbrlDocument", return_value=mocker.MagicMock()
+        )
+        filing = Filing(
+            cik="0001234567",
+            accession_number="0001234567-24-000001",
+            form_type="10-K",
+            filing_date=date(2024, 1, 15),
+            primary_s3_key="s3://bucket/test.htm",
+            primary_url="https://sec.gov/test.htm",
+        )
+
+        pipeline._process_one(filing)
+
+        assert pipeline.stats.ambiguous_shares_outstanding == 1
+        assert (filing.cik, filing.accession_number) in pipeline.failures._entries
+
+    def test_all_shares_outstanding_as_of_iso_date(
+        self, pipeline: CompanyFactsPipeline, tmp_path: pytest.TempPathFactory
+    ) -> None:
+        """all_shares_outstanding_as_of uses ISO date strings; empty slot for None."""
+        pipeline.config.output_file = str(tmp_path / "out.parquet")
+        secs = [
+            RegisteredSecurity(ticker="ORD", shares_outstanding_as_of=None),
+            RegisteredSecurity(
+                ticker="ADSX",
+                shares_outstanding_as_of=date(2024, 9, 28),
+            ),
+        ]
+        record = _make_record_with_securities(secs)
+
+        pipeline.save_output([record])
+
+        df = pd.read_parquet(pipeline.config.output_file)
+        assert df["all_shares_outstanding_as_of"].iloc[0] == " | 2024-09-28"
